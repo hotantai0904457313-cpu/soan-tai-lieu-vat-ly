@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Soạn Tài Liệu Vật Lý</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body>
+
+<!-- ══ TOOLBAR ══════════════════════════════════════════════════ -->
+<div id="toolbar">
+  <div class="app-title">⚛ Vật Lý <span>THPT</span></div>
+
+  <button class="tb-btn" onclick="toggleSidebar()" title="Thư viện tài liệu">
+    📚 Thư viện
+  </button>
+  <div class="import-group">
+    <button class="tb-btn import-type-btn" onclick="triggerImportImg()" title="Nhập ảnh (JPG, PNG, ...)">📷</button>
+    <button class="tb-btn import-type-btn" onclick="triggerImportPdf()" title="Nhập PDF">📄</button>
+    <button class="tb-btn import-type-btn primary" onclick="triggerImportWord()" title="Nhập Word (DOCX)">📝 Nhập</button>
+  </div>
+  <input type="file" id="file-img"  accept="image/*,.jpg,.jpeg,.png,.gif,.webp,.tiff,.bmp"
+         style="display:none" onchange="onFileSelectedAny(this,'image')">
+  <input type="file" id="file-pdf"  accept=".pdf"
+         style="display:none" onchange="onFileSelectedAny(this,'pdf')">
+  <input type="file" id="file-word" accept=".docx,.doc"
+         style="display:none" onchange="onFileSelectedAny(this,'word')">
+
+  <button class="tb-btn" onclick="openP2W()"
+          title="Chuyển PDF (kể cả bản scan) sang Word — giữ công thức sửa được, ảnh, bảng">
+    📄→📝 PDF sang Word
+  </button>
+
+  <button class="tb-btn" onclick="openP2MD()"
+          title="OCR PDF scan bằng Gemini → Markdown sạch để nạp vào NotebookLM">
+    📄→📑 PDF sang Markdown
+  </button>
+
+  <div class="tb-sep"></div>
+
+  <button class="tb-btn" onclick="saveDocument()">💾 Lưu</button>
+  <button class="tb-btn" id="btn-doc-info" onclick="openSaveModal(true)" title="Sửa thông tin tài liệu (lớp, chương, loại...)">ℹ Thông tin</button>
+  <div class="export-group" id="export-grp-student">
+    <button class="tb-btn export-main-btn" onclick="exportAs('student','pdf')">📄 Học sinh</button>
+    <button class="tb-btn export-arrow-btn" onclick="toggleExportMenu('student');event.stopPropagation()">▼</button>
+    <div class="export-menu" id="export-menu-student">
+      <div onclick="exportAs('student','pdf')">📄 Xuất PDF</div>
+      <div onclick="exportAs('student','word')">📝 Xuất Word</div>
+    </div>
+  </div>
+  <div class="export-group" id="export-grp-answer">
+    <button class="tb-btn export-main-btn primary" onclick="exportAs('answer','pdf')">📋 Đáp án</button>
+    <button class="tb-btn export-arrow-btn primary" onclick="toggleExportMenu('answer');event.stopPropagation()">▼</button>
+    <div class="export-menu" id="export-menu-answer">
+      <div onclick="exportAs('answer','pdf')">📄 Xuất PDF</div>
+      <div onclick="exportAs('answer','word')">📝 Xuất Word</div>
+    </div>
+  </div>
+  <button class="tb-btn" onclick="showPrintPreview()">🖨 Xem trước</button>
+  <button class="tb-btn" onclick="exportAnswerTable()" title="Xuất bảng đáp án tổng hợp (.xlsx)">
+    📊 Bảng đáp án
+  </button>
+
+  <div class="tb-sep"></div>
+
+  <!-- Ẩn/Hiện đáp án nhanh -->
+  <button class="tb-btn" onclick="toggleAllSolutions(true)" title="Hiện tất cả lời giải">👁 Bản đáp án</button>
+  <button class="tb-btn" onclick="toggleAllSolutions(false)" title="Ẩn tất cả lời giải">🙈 Bản học sinh</button>
+
+  <div class="tb-spacer"></div>
+
+  <div id="status-indicator">
+    <div id="status-dot"></div>
+    <span id="status-text">Đang kiểm tra...</span>
+  </div>
+
+  <div class="tb-sep"></div>
+  <button class="tb-btn" onclick="openSettings()">⚙ Cài đặt</button>
+</div>
+
+<!-- ══ MAIN ═════════════════════════════════════════════════════ -->
+<div id="main">
+
+  <!-- Sidebar thư viện -->
+  <div id="sidebar" class="hidden">
+    <div id="sidebar-header">
+      📚 Thư viện tài liệu
+      <button onclick="toggleSidebar()" title="Đóng">✕</button>
+    </div>
+    <div id="sidebar-search">
+      <input type="text" placeholder="🔍 Tìm tài liệu..." oninput="searchDocs(this.value)">
+    </div>
+    <div id="sidebar-filters">
+      <button class="filter-tab active" onclick="setSidebarFilter(null, this)">Tất cả</button>
+      <button class="filter-tab" onclick="setSidebarFilter(10, this)">Lớp 10</button>
+      <button class="filter-tab" onclick="setSidebarFilter(11, this)">Lớp 11</button>
+      <button class="filter-tab" onclick="setSidebarFilter(12, this)">Lớp 12</button>
+    </div>
+    <div id="doc-list">
+      <div style="text-align:center;color:var(--text-muted);font-size:12px;padding:20px;">
+        Chưa có tài liệu nào
+      </div>
+    </div>
+  </div>
+
+  <!-- Panel trái — File gốc -->
+  <div id="panel-left" class="panel">
+    <div class="panel-header">
+      📄 File gốc (chỉ xem)
+      <button onclick="toggleLeftPanel()" title="Thu gọn/mở rộng">⇄</button>
+    </div>
+    <div class="panel-body" id="original-body">
+      <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--text-muted);gap:10px;padding:30px;text-align:center;">
+        <div style="font-size:48px;">📄</div>
+        <div style="font-size:13px;">File gốc sẽ hiển thị ở đây sau khi import</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Splitter -->
+  <div id="splitter"></div>
+
+  <!-- Panel phải — Editor -->
+  <div id="panel-right" class="panel">
+    <div class="panel-header">
+      ✏️ Tài liệu đang làm việc
+      <span class="badge" id="q-count-badge">0 câu</span>
+      <span class="badge info-badge" id="doc-info-badge" style="display:none;margin-left:4px;"></span>
+    </div>
+
+    <!-- Toolbar editor -->
+    <div id="editor-toolbar">
+      <button class="ed-btn" onclick="document.execCommand('bold')" title="In đậm"><b>B</b></button>
+      <button class="ed-btn" onclick="document.execCommand('italic')" title="Nghiêng"><i>I</i></button>
+      <button class="ed-btn" onclick="document.execCommand('underline')" title="Gạch chân"><u>U</u></button>
+      <div class="ed-sep"></div>
+      <select id="font-size-sel" onchange="document.execCommand('fontSize',false,this.value)"
+              style="border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px;">
+        <option value="3">12pt</option>
+        <option value="4" selected>14pt</option>
+        <option value="5">16pt</option>
+        <option value="6">18pt</option>
+      </select>
+      <div class="ed-sep"></div>
+      <button class="ed-btn" id="btn-math" onclick="toggleMathPanel(this)" title="Chèn ký hiệu Vật lý">∑ Ký hiệu</button>
+      <div class="ed-sep"></div>
+      <button class="ed-btn" onclick="document.execCommand('justifyLeft')" title="Căn trái">⬅</button>
+      <button class="ed-btn" onclick="document.execCommand('justifyCenter')" title="Căn giữa">↔</button>
+      <button class="ed-btn" onclick="document.execCommand('justifyRight')" title="Căn phải">➡</button>
+      <div class="ed-sep"></div>
+      <label style="font-size:12px;color:var(--text-muted);cursor:pointer;">
+        <input type="color" onchange="document.execCommand('foreColor',false,this.value)"
+               style="width:22px;height:22px;border:none;cursor:pointer;" title="Màu chữ">
+        🎨
+      </label>
+    </div>
+
+    <!-- Nội dung editor -->
+    <div id="editor-content" contenteditable="false">
+      <div class="empty-state" id="empty-state-msg">
+        <div class="empty-icon">📝</div>
+        <h3>Chưa có tài liệu</h3>
+        <p>Bấm <strong>📂 Nhập file</strong> ở trên để bắt đầu,<br>hoặc mở tài liệu từ <strong>📚 Thư viện</strong>.</p>
+        <button class="btn btn-primary" onclick="triggerImportWord()" style="margin-top:12px;">
+          📂 Nhập file ngay
+        </button>
+      </div>
+    </div>
+
+    <!-- AI Panel -->
+    <div id="ai-panel">
+      <div id="ai-panel-inner">
+        <button class="tb-btn ai-btn" style="background:var(--navy);color:#fff;border-color:var(--navy);"
+                onclick="solveAll()">🤖 Giải toàn đề</button>
+        <button class="tb-btn ai-btn" style="background:#6b21a8;color:#fff;border-color:#6b21a8;"
+                onclick="reviewDoc()">🔍 Nhận xét đề</button>
+        <div class="ai-spinner" id="ai-spinner"></div>
+        <div id="ai-status-text" style="font-size:12px;color:var(--text-muted);"></div>
+        <button onclick="toggleAIPanel()" style="margin-left:auto;background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:13px;" title="Thu/mở panel AI">▼</button>
+        <div id="ai-review-box"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MATH PANEL ═══════════════════════════════════════════════ -->
+<div id="math-panel">
+  <h4>Ký hiệu Vật lý — click để chèn vào vị trí con trỏ</h4>
+  <div class="math-symbols"></div>
+  <hr style="border:none;border-top:1px solid var(--border);margin:8px 0;">
+  <div style="font-size:11px;color:var(--text-muted);">
+    Click vào ký hiệu để chèn ngay tại vị trí con trỏ trong câu hỏi
+  </div>
+</div>
+
+<!-- ══ MODAL XUẤT FILE ══════════════════════════════════════════ -->
+<div class="modal-overlay" id="export-modal">
+  <div class="modal-box">
+    <div class="modal-header">
+      📤 Xuất tài liệu
+      <button onclick="closeModal('export-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>Định dạng xuất</label>
+        <select id="export-format">
+          <option value="pdf">PDF (.pdf) — In ấn, gửi học sinh</option>
+          <option value="word">Word (.docx) — Chỉnh sửa thêm</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Lời giải AI</label>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:4px;">
+          <input type="checkbox" id="export-show-sol" checked style="width:16px;height:16px;">
+          <label for="export-show-sol" style="font-size:13px;font-weight:normal;text-transform:none;letter-spacing:0;">
+            Hiện lời giải AI trong file xuất (bản đáp án)
+          </label>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">
+          Bỏ tick → Bản học sinh (chỉ có câu hỏi, không có đáp án)
+        </div>
+      </div>
+      <div style="background:var(--navy-light);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--navy);">
+        ℹ File sẽ được lưu vào thư mục Downloads và tự copy sang OneDrive (nếu đã cấu hình).
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('export-modal')">Hủy</button>
+      <button class="btn btn-primary" onclick="doExport()">📤 Xuất ngay</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODAL CHỌN TRANG KHI IMPORT PDF ══════════════════════════ -->
+<div class="modal-overlay" id="import-page-modal">
+  <div class="modal-box" style="max-width:480px;">
+    <div class="modal-header">
+      📄 Nhập PDF — chọn trang
+      <button onclick="closeModal('import-page-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="font-size:13px;color:var(--text-muted);margin-bottom:10px;">
+        File: <b id="import-page-fname" style="color:var(--navy);">—</b>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:5px;font-size:13px;cursor:pointer;">
+          <input type="checkbox" id="import-page-enable" onchange="importTogglePageRange(this.checked)" style="accent-color:var(--navy)">
+          <span style="font-weight:600;">Chỉ nhập một số trang</span>
+        </label>
+      </div>
+      <div id="import-page-input" style="display:none;margin-top:10px;align-items:center;gap:8px;">
+        <input type="text" id="import-pages" placeholder="vd: 1-3 hoặc 1,2,5 hoặc 2"
+               style="width:170px;padding:6px 9px;border:1.5px solid var(--navy);border-radius:6px;
+                      font-size:13px;font-family:inherit;">
+        <span style="font-size:11px;color:var(--text-muted);">(tính từ trang 1)</span>
+      </div>
+      <div style="margin-top:12px;font-size:11px;color:var(--text-muted);">
+        Bỏ trống / không tick → nhập toàn bộ đề. Chọn trang giúp đọc nhanh hơn khi chỉ cần một phần.
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('import-page-modal')">Hủy</button>
+      <button class="btn btn-primary" onclick="confirmImportPdf()">📄 Nhập đề</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODAL PDF → WORD ═════════════════════════════════════════ -->
+<div class="modal-overlay" id="p2w-modal">
+  <div class="modal-box" style="max-width:660px;">
+    <div class="modal-header">
+      📄→📝 Chuyển PDF sang Word
+      <button onclick="closeModal('p2w-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="p2w-ready-warn" style="display:none;background:#fff4e5;border:1px solid #ffb454;
+           border-radius:6px;padding:10px 12px;font-size:12px;color:#9a5b00;margin-bottom:12px;"></div>
+
+      <div id="p2w-dropzone"
+           onclick="document.getElementById('p2w-files').click()"
+           ondragover="event.preventDefault();this.classList.add('drag')"
+           ondragleave="this.classList.remove('drag')"
+           ondrop="p2wDrop(event)"
+           style="border:2px dashed var(--navy);border-radius:8px;padding:22px;text-align:center;
+                  cursor:pointer;background:var(--navy-light);transition:.15s;">
+        <input type="file" id="p2w-files" accept=".pdf" multiple style="display:none"
+               onchange="p2wAddFiles(this.files)">
+        <div style="font-size:14px;font-weight:600;color:var(--navy);">📥 Kéo thả file PDF vào đây, hoặc bấm để chọn</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:6px;">
+          Chọn được nhiều file cùng lúc · Hỗ trợ cả PDF scan (tự nhận diện và OCR)
+        </div>
+      </div>
+
+      <div id="p2w-list" style="margin-top:14px;display:flex;flex-direction:column;gap:8px;"></div>
+
+      <!-- Chon trang -->
+      <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;">
+          <input type="checkbox" id="p2w-page-enable" onchange="p2wTogglePageRange(this.checked)" style="accent-color:var(--navy)">
+          <span style="font-weight:600;">Chon trang cu the</span>
+        </label>
+        <div id="p2w-page-input" style="display:none;display:flex;align-items:center;gap:6px;">
+          <input type="text" id="p2w-pages" placeholder="vd: 1-3 hoac 1,2,5 hoac 2"
+                 style="width:140px;padding:5px 8px;border:1.5px solid var(--navy);border-radius:6px;
+                        font-size:12px;font-family:inherit;">
+          <span style="font-size:11px;color:var(--text-muted);">(tinh tu trang 1)</span>
+        </div>
+      </div>
+
+      <div style="margin-top:10px;font-size:11px;font-weight:700;color:var(--navy);text-transform:uppercase;letter-spacing:.5px;">Phuong phap chuyen doi</div>
+      <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;
+                      background:var(--navy-light);border:2px solid var(--navy);
+                      border-radius:7px;padding:10px 14px;font-size:12px;font-weight:600;">
+          <input type="radio" name="p2wMethod" value="hybrid" id="p2w-method-hybrid" checked style="accent-color:var(--navy)">
+          <div>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span>&#9889; Tu dong lai (ODL + &#129302; Gemini Vision)</span>
+              <span style="background:#16a34a;color:#fff;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700;">Khuyen dung</span>
+            </div>
+            <div style="font-size:10px;color:#555;font-weight:400;margin-top:2px;">Trang chu dung ODL (nhanh) · trang nhieu cong thuc/hinh/bang dung Gemini Vision (chay song song)</div>
+          </div>
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;
+                      background:#f5f5f5;border:1.5px solid #ccc;
+                      border-radius:7px;padding:10px 14px;font-size:12px;font-weight:600;">
+          <input type="radio" name="p2wMethod" value="marker" style="accent-color:#666">
+          <div>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <span>&#9881; Marker</span>
+              <span style="background:#888;color:#fff;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700;">Offline</span>
+            </div>
+            <div style="font-size:10px;color:#555;font-weight:400;margin-top:2px;">Khong can internet, khong can API key</div>
+          </div>
+        </label>
+      </div>
+
+      <div id="p2w-model-info" style="font-size:11px;color:#6b7280;margin-top:6px;padding:4px 8px;
+           background:#f9fafb;border-radius:5px;font-family:monospace;"></div>
+      <div id="p2w-no-key-note" style="display:none;background:#f0f9ff;border:1px solid #7dd3fc;
+           border-radius:6px;padding:8px 12px;font-size:11px;color:#0369a1;margin-top:6px;">
+      </div>
+      <div id="p2w-java-warn" style="display:none;background:#fff4e5;border:1px solid #ffb454;
+           border-radius:6px;padding:8px 12px;font-size:11px;color:#9a5b00;margin-top:8px;">
+        &#9888; OpenDataLoader can Java 11+. Tai tai:
+        <a href="https://adoptium.net" target="_blank" style="color:#9a5b00;font-weight:700;">adoptium.net</a>
+      </div>
+
+      <div style="background:var(--navy-light);border-radius:6px;padding:10px 12px;font-size:12px;
+                  color:var(--navy);margin-top:10px;">
+        &#x2139; Ket qua luu vao Downloads (va OneDrive neu da cau hinh).
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('p2w-modal')">Dong</button>
+      <button class="btn btn-primary" id="p2w-start-btn" onclick="p2wStart()" disabled>&#128640; Bat dau chuyen</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODAL PDF → MARKDOWN (NotebookLM) ════════════════════════ -->
+<div class="modal-overlay" id="p2md-modal">
+  <div class="modal-box" style="max-width:660px;">
+    <div class="modal-header">
+      📄→📑 Chuyển PDF sang Markdown (NotebookLM)
+      <button onclick="closeModal('p2md-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="p2md-ready-warn" style="display:none;background:#fff4e5;border:1px solid #ffb454;
+           border-radius:6px;padding:10px 12px;font-size:12px;color:#9a5b00;margin-bottom:12px;"></div>
+
+      <div id="p2md-dropzone"
+           onclick="document.getElementById('p2md-files').click()"
+           ondragover="event.preventDefault();this.classList.add('drag')"
+           ondragleave="this.classList.remove('drag')"
+           ondrop="p2mdDrop(event)"
+           style="border:2px dashed var(--navy);border-radius:8px;padding:22px;text-align:center;
+                  cursor:pointer;background:var(--navy-light);transition:.15s;">
+        <input type="file" id="p2md-files" accept=".pdf" multiple style="display:none"
+               onchange="p2mdAddFiles(this.files)">
+        <div style="font-size:14px;font-weight:600;color:var(--navy);">📥 Kéo thả file PDF (scan) vào đây, hoặc bấm để chọn</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:6px;">
+          OCR bằng Gemini Vision · công thức giữ dạng $...$ · hình được mô tả bằng chữ · bảng thành bảng Markdown
+        </div>
+      </div>
+
+      <div id="p2md-list" style="margin-top:14px;display:flex;flex-direction:column;gap:8px;"></div>
+
+      <!-- Chon trang -->
+      <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;cursor:pointer;">
+          <input type="checkbox" id="p2md-page-enable" onchange="p2mdTogglePageRange(this.checked)" style="accent-color:var(--navy)">
+          <span style="font-weight:600;">Chon trang cu the</span>
+        </label>
+        <div id="p2md-page-input" style="display:none;align-items:center;gap:6px;">
+          <input type="text" id="p2md-pages" placeholder="vd: 1-30 hoac 1,2,5"
+                 style="width:160px;padding:5px 8px;border:1.5px solid var(--navy);border-radius:6px;
+                        font-size:12px;font-family:inherit;">
+          <span style="font-size:11px;color:var(--text-muted);">(tinh tu trang 1)</span>
+        </div>
+      </div>
+
+      <div id="p2md-bigfile-warn" style="display:none;background:#fff4e5;border:1px solid #ffb454;
+           border-radius:6px;padding:8px 12px;font-size:11px;color:#9a5b00;margin-top:8px;">
+        &#9888; File nhiều trang dễ chạm giới hạn quota Gemini. Nên chia mỗi lần ~30-50 trang bằng ô "Chọn trang" ở trên.
+      </div>
+      <div id="p2md-no-key-note" style="display:none;background:#fff4e5;border:1px solid #ffb454;
+           border-radius:6px;padding:8px 12px;font-size:11px;color:#9a5b00;margin-top:8px;">
+        &#9888; Chưa có API key Gemini/9Router. Vào Cài đặt → AI để nhập trước khi OCR.
+      </div>
+
+      <div style="background:var(--navy-light);border-radius:6px;padding:10px 12px;font-size:12px;
+                  color:var(--navy);margin-top:10px;">
+        &#x2139; File .md lưu vào Downloads (va OneDrive neu da cau hinh). Sau đó nạp vào NotebookLM.
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('p2md-modal')">Dong</button>
+      <button class="btn btn-primary" id="p2md-start-btn" onclick="p2mdStart()" disabled>&#128640; Bat dau OCR</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODAL CÀI ĐẶT ════════════════════════════════════════════ -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal-box">
+    <div class="modal-header">
+      ⚙ Cài đặt ứng dụng
+      <button onclick="closeModal('settings-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="form-section">🏫 Thông tin trường</div>
+      <div class="form-group">
+        <label>Tên giáo viên</label>
+        <input type="text" id="set-teacher" placeholder="Nhập tên giáo viên">
+      </div>
+      <div class="form-group">
+        <label>Tên trường</label>
+        <input type="text" id="set-school" placeholder="Nhập tên trường">
+      </div>
+      <div class="form-group">
+        <label>Logo trường (PNG/JPG)</label>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="btn btn-secondary" onclick="uploadLogo()">📷 Upload logo...</button>
+          <input type="file" id="logo-input" accept=".png,.jpg,.jpeg" style="display:none"
+                 onchange="onLogoSelected(this)">
+          <span style="font-size:11px;color:var(--text-muted);">Hiển thị ở góc trái header PDF</span>
+        </div>
+      </div>
+
+      <div class="form-section">📄 Import file — Pandoc</div>
+      <div class="form-group">
+        <label>Trạng thái Pandoc</label>
+        <div id="pandoc-status" style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:6px;background:var(--bg);border:1px solid var(--border);">
+          <span id="pandoc-dot" style="width:10px;height:10px;border-radius:50%;background:#aaa;flex-shrink:0;"></span>
+          <span id="pandoc-msg" style="font-size:12px;color:var(--text-muted);">Đang kiểm tra...</span>
+          <button class="btn btn-secondary" id="pandoc-install-btn" style="display:none;font-size:11px;padding:3px 10px;"
+                  onclick="window.open('https://github.com/jgm/pandoc/releases/latest','_blank')">
+            Tải Pandoc
+          </button>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">
+          Pandoc giúp import file Word <strong>giữ nguyên công thức</strong> (MathType, Equation Editor → LaTeX).
+          Nếu chưa có: tải installer .msi → cài → khởi động lại app.
+        </div>
+      </div>
+
+      <div class="form-section">🤖 Cài đặt AI</div>
+      <div class="form-group">
+        <label>API Key Gemini</label>
+        <div style="display:flex;gap:6px;">
+          <input type="password" id="set-gemini" placeholder="Nhập key mới để thay đổi, bỏ trống để giữ key cũ" style="flex:1">
+          <button class="btn btn-secondary" onclick="testAPIKey('gemini')">Kiểm tra</button>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:3px;">
+          Lấy key tại: <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:var(--accent);">aistudio.google.com</a>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>API Key Claude (Anthropic)</label>
+        <div style="display:flex;gap:6px;">
+          <input type="password" id="set-claude" placeholder="Nhập key mới để thay đổi, bỏ trống để giữ key cũ" style="flex:1">
+          <button class="btn btn-secondary" onclick="testAPIKey('claude')">Kiểm tra</button>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:3px;">
+          Lấy key tại: <a href="https://console.anthropic.com" target="_blank" style="color:var(--accent);">console.anthropic.com</a>
+        </div>
+      </div>
+      <div class="form-section">🔀 9Router (Local AI Proxy — Miễn phí)</div>
+      <div class="form-group">
+        <label>
+          Trạng thái 9Router
+          <span id="niner-status-badge" style="margin-left:8px;font-size:11px;padding:2px 8px;border-radius:10px;background:#e5e7eb;color:#6b7280;">Chưa kiểm tra</span>
+        </label>
+        <button class="btn btn-secondary" onclick="checkNinerRouter()" style="width:100%">Kiểm tra 9Router đang chạy không</button>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">
+          Khởi động: vào thư mục <code>9router-master/9router-master</code> → chạy
+          <code style="background:#f3f4f6;padding:2px 5px;border-radius:3px;">npm install</code> rồi
+          <code style="background:#f3f4f6;padding:2px 5px;border-radius:3px;">npm run dev</code>
+          — Dashboard: <a href="http://localhost:20128/dashboard" target="_blank" style="color:var(--accent);">localhost:20128/dashboard</a>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>URL API của 9Router</label>
+        <input type="text" id="set-niner-url" value="http://localhost:20128/v1" placeholder="http://localhost:20128/v1">
+      </div>
+      <div class="form-group">
+        <label>API Key 9Router</label>
+        <div style="display:flex;gap:6px;">
+          <input type="password" id="set-niner-key" placeholder="Nhập key mới để thay đổi, bỏ trống để giữ key cũ" style="flex:1">
+          <button class="btn btn-secondary" onclick="testAPIKey('niner')">Kiểm tra</button>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:3px;">
+          Lấy key tại Dashboard → Endpoints sau khi kết nối ít nhất 1 provider
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Model AI — Câu lý thuyết / trắc nghiệm</label>
+        <select id="set-model-th">
+          <optgroup label="── Antigravity via 9Router ✅ (mặc định, đã kết nối) ──">
+            <option value="ag/gemini-3.5-flash-low">Gemini 3.5 Flash (Medium — khuyên dùng)</option>
+            <option value="ag/gemini-3.5-flash-extra-low">Gemini 3.5 Flash (Low — nhanh nhất)</option>
+            <option value="ag/gemini-3-flash">Gemini 3 Flash (cũ hơn)</option>
+            <option value="ag/claude-sonnet-4-6">Claude Sonnet 4.6 (cần bật trong 9Router)</option>
+          </optgroup>
+          <optgroup label="── Gemini CLI via 9Router (⚠ CLI không còn hoạt động) ──">
+            <option value="gc/gemini-3-flash-preview">Gemini 3 Flash (CLI cũ)</option>
+            <option value="gc/gemini-3-pro-preview">Gemini 3 Pro (CLI cũ)</option>
+          </optgroup>
+          <optgroup label="── Kiro AI via 9Router ✅ (miễn phí) ──">
+            <option value="kr/claude-sonnet-4.5-thinking">Kiro · Claude Sonnet 4.5 Thinking</option>
+            <option value="kr/claude-sonnet-4.5">Kiro · Claude Sonnet 4.5</option>
+            <option value="kr/claude-haiku-4.5">Kiro · Claude Haiku 4.5 (nhanh)</option>
+          </optgroup>
+          <optgroup label="── Gemini API trực tiếp (cần Gemini key) ──">
+            <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+            <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+          </optgroup>
+          <optgroup label="── Claude API trực tiếp (cần Claude key) ──">
+            <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+            <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+          </optgroup>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Model AI — Bài tập tính toán / tự luận</label>
+        <select id="set-model-ex">
+          <optgroup label="── Antigravity via 9Router ✅ (mặc định, đã kết nối) ──">
+            <option value="ag/gemini-3.5-flash-low">Gemini 3.5 Flash (Medium — khuyên dùng)</option>
+            <option value="ag/gemini-3.5-flash-extra-low">Gemini 3.5 Flash (Low — nhanh nhất)</option>
+            <option value="ag/gemini-3-flash">Gemini 3 Flash (cũ hơn)</option>
+            <option value="ag/claude-sonnet-4-6">Claude Sonnet 4.6 Thinking (mạnh nhất cho bài khó, cần bật trong 9Router)</option>
+            <option value="ag/gemini-3.1-pro-low">Gemini 3.1 Pro (mạnh, chậm 3×, cần bật trong 9Router)</option>
+          </optgroup>
+          <optgroup label="── Gemini CLI via 9Router (⚠ CLI không còn hoạt động) ──">
+            <option value="gc/gemini-3-flash-preview">Gemini 3 Flash (CLI cũ)</option>
+            <option value="gc/gemini-3-pro-preview">Gemini 3 Pro (CLI cũ)</option>
+          </optgroup>
+          <optgroup label="── Kiro AI via 9Router ✅ (miễn phí) ──">
+            <option value="kr/claude-sonnet-4.5-thinking">Kiro · Claude Sonnet 4.5 Thinking (phức tạp)</option>
+            <option value="kr/claude-sonnet-4.5">Kiro · Claude Sonnet 4.5</option>
+            <option value="kr/claude-haiku-4.5">Kiro · Claude Haiku 4.5 (nhanh)</option>
+          </optgroup>
+          <optgroup label="── Gemini API trực tiếp (cần Gemini key) ──">
+            <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+            <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+          </optgroup>
+          <optgroup label="── Claude API trực tiếp (cần Claude key) ──">
+            <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+            <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+          </optgroup>
+        </select>
+      </div>
+
+      <div class="form-section">💾 File & Lưu trữ</div>
+      <div class="form-group">
+        <label>Thư mục lưu file xuất (mặc định: Downloads)</label>
+        <input type="text" id="set-save-dir" placeholder="C:\Users\...\Downloads">
+      </div>
+      <div class="form-group">
+        <label>Thư mục Google Drive (tự copy sau khi xuất)</label>
+        <input type="text" id="set-gdrive" placeholder="C:\Users\...\Google Drive\My Drive">
+        <div style="font-size:11px;color:var(--text-muted);margin-top:3px;">
+          Cần cài <a href="https://drive.google.com/drive/download" target="_blank" style="color:var(--accent);">Google Drive desktop</a>
+          để thư mục tự đồng bộ lên Drive. Sau khi xuất, app hiển thị thông báo đã lưu.
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Thư mục OneDrive (tự copy sau khi xuất)</label>
+        <input type="text" id="set-onedrive" placeholder="C:\Users\...\OneDrive">
+      </div>
+
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('settings-modal')">Hủy</button>
+      <button class="btn btn-primary" onclick="saveSettings()">💾 Lưu cài đặt</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODAL THÔNG TIN TÀI LIỆU ════════════════════════════════ -->
+<div class="modal-overlay" id="save-meta-modal">
+  <div class="modal-box">
+    <div class="modal-header">
+      📋 Thông tin tài liệu
+      <button onclick="closeModal('save-meta-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="form-group">
+        <label>Tiêu đề tài liệu <span style="color:var(--red)">*</span></label>
+        <input type="text" id="smeta-title" placeholder="VD: Đề kiểm tra 45 phút — Vật lý 11 — Chương Điện trường">
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+        <div class="form-group" style="margin-bottom:0;">
+          <label>Loại tài liệu</label>
+          <select id="smeta-doctype">
+            <option value="de_thi">Đề kiểm tra / Đề thi</option>
+            <option value="phieu_bai_tap">Phiếu bài tập</option>
+            <option value="bai_giang">Bài giảng</option>
+            <option value="khac">Khác</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label>Khối lớp</label>
+          <select id="smeta-grade">
+            <option value="">— Không xác định —</option>
+            <option value="10">Lớp 10</option>
+            <option value="11">Lớp 11</option>
+            <option value="12">Lớp 12</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px;">
+        <div class="form-group" style="margin-bottom:0;">
+          <label>Chương / Chủ đề</label>
+          <input type="text" id="smeta-chapter" placeholder="VD: Chương 3: Điện trường">
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label>Học kỳ</label>
+          <select id="smeta-semester">
+            <option value="">— Không xác định —</option>
+            <option value="HK1">Học kỳ 1</option>
+            <option value="HK2">Học kỳ 2</option>
+          </select>
+        </div>
+      </div>
+
+      <div style="background:var(--navy-light);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--navy);margin-top:14px;">
+        ℹ Thông tin này dùng để tìm kiếm và lọc trong Thư viện. Có thể chỉnh lại bất cứ lúc nào qua nút <strong>ℹ Thông tin</strong> trên toolbar.
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('save-meta-modal')">Hủy</button>
+      <button class="btn btn-primary" id="smeta-confirm-btn" onclick="confirmSaveMeta()" data-mode="save">💾 Lưu tài liệu</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ PRINT PREVIEW ════════════════════════════════════════════ -->
+<div id="print-preview" onclick="if(event.target===this)this.classList.remove('show')">
+  <div style="position:relative;width:820px;max-width:96vw;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+      <span style="color:#fff;font-weight:700;font-size:14px;">🖨 Xem trước bản in</span>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-success" onclick="$('export-modal').classList.add('show');$('print-preview').classList.remove('show')"
+                style="font-size:12px;padding:6px 14px;">📤 Xuất file</button>
+        <button class="btn btn-secondary" onclick="$('print-preview').classList.remove('show')"
+                style="font-size:12px;padding:6px 14px;">✕ Đóng</button>
+      </div>
+    </div>
+    <div id="print-preview-inner">
+      <div id="print-preview-body"
+           style="font-family:'Times New Roman',Times,serif;font-size:12pt;line-height:1.8;">
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ LOADING ══════════════════════════════════════════════════ -->
+<div id="loading-overlay">
+  <div class="loading-spinner"></div>
+  <div id="loading-text">Đang xử lý...</div>
+</div>
+
+<!-- ══ TOAST ════════════════════════════════════════════════════ -->
+<div id="toast-container"></div>
+
+<script src="/static/math_input.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

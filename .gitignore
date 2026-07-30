@@ -1,0 +1,24 @@
+# ── DỮ LIỆU CÁ NHÂN — tuyệt đối không đưa lên repo ──────────────
+# (chứa API key trong documents.db, tài liệu import, file xuất)
+data/
+
+# ── Môi trường Python riêng cho Marker (~1.2GB) ─────────────────
+venv_marker/
+
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Log & file tạm ──────────────────────────────────────────────
+*.log
+app_err.txt
+app_log.txt
+bat-output.txt
+
+# ── Windows ─────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+
+# ── Logo riêng của trường (người dùng tự thêm) ──────────────────
+static/logo.png
