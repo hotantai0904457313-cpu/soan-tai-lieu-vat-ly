@@ -307,6 +307,53 @@ def _fix_degree_zero(text: str) -> str:
     return _DEG_ZERO_RE.sub(_sub, text)
 
 
+# ── Số mũ / chỉ số bị "bẹp" khi trích PDF ────────────────────────────
+# Text layer của PDF không giữ vị trí cao/thấp của ký tự: 10⁵ → "105",
+# V₀ → "V 0", 3,3.10⁻³ → "3,3.10−3". Khôi phục về ký tự Unicode ⁵ ₀ ⁻³
+# để scanner unicode_to_latex xử lý thống nhất như PDF giữ đúng định dạng.
+_SUP_OF = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+           '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹'}
+_SUB_OF = {'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
+           '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉'}
+
+# a) Khoa học số mũ ÂM: "3,3.10−3" / "1,6.10-19" → 3,3.10⁻³ (mantissa + chấm
+#    nhân + 10 + dấu trừ DÍNH LIỀN chỉ có thể là số mũ — số thường không viết vậy)
+_SCI_NEG_RE = re.compile(r'(?<=\d)\.10[−–‐-](\d{1,2})(?!\d)')
+# b) Khoa học số mũ DƯƠNG: "2.105Pa" → 2.10⁵Pa — CHỈ khi ngay sau là đơn vị đo
+#    (tránh phá số hiệu mục lục/hình: "Hình 2.104 mô tả..." giữ nguyên)
+_SCI_POS_RE = re.compile(
+    r'(?<=\d)\.10(\d{1,2})'
+    r'(?= ?(?:N/m|mmHg\b|atm\b|[kM]?Pa\b|[kMG]?Hz\b|mol\b|gam\b|kg\b|g\b'
+    r'|m[²³]|[ck]m\b|dm\b|mm\b|m\b|lít\b|[kM]?J\b|[kMG]?W\b|K\b|s\b|N\b'
+    r'|[kMG]?eV\b|Bq\b|Ω|µ))')
+# c) 10^x trần dính đơn vị áp suất: "105N/m2" → 10⁵N/m² (đề Vật lý luôn ghi
+#    áp suất dạng 10^x N/m²; số đo thật hiếm khi dính liền không khoảng trắng)
+_POW10_PRES_RE = re.compile(r'(?<![\d.,])10(\d)(?=N/m[²2³]|[kM]?Pa\b|mmHg\b|atm\b)')
+# d) Chỉ số dưới trước dấu "=": "p 1 = 748" / "V0 =" → p₁ =, V₀ =
+_SUB_EQ_RE = re.compile(r'(?<![A-Za-zÀ-Ỹà-ỹ0-9])([A-Za-z]) ?([0-9])(?=[ \t]*=)')
+# e) Cặp biến trạng thái p/V/T: "p 1 V 1 = p 2 V 2" — chỉ nhận khi ngay sau là
+#    dấu câu / hết dòng / một cặp p-V-T khác (KHÔNG ăn "V 2 lít khí")
+_SUB_STATE_RE = re.compile(
+    r'(?<![A-Za-zÀ-Ỹà-ỹ0-9])([pVT]) ([0-9])'
+    r'(?=[ \t]*(?:[=.,;:)?!]|$|[pVT] ?[0-9]))', re.MULTILINE)
+
+
+def _fix_flattened_scripts(text: str) -> str:
+    """Khôi phục số mũ/chỉ số bị mất định dạng cao/thấp khi trích text PDF:
+    105N/m2 → 10⁵N/m² · 3,3.10−3m³ → 3,3.10⁻³m³ · p 1 = → p₁ ="""
+    if not text:
+        return text
+    _sup = lambda ds: ''.join(_SUP_OF[d] for d in ds)
+    text = _SCI_NEG_RE.sub(lambda m: '.10⁻' + _sup(m.group(1)), text)
+    text = _SCI_POS_RE.sub(lambda m: '.10' + _sup(m.group(1)), text)
+    text = _POW10_PRES_RE.sub(lambda m: '10' + _sup(m.group(1)), text)
+    # STATE chạy TRƯỚC EQ: "p 1 V 1 = ..." — nếu EQ đổi "V 1 =" → "V₁ =" trước
+    # thì lookahead [pVT] [0-9] của STATE không còn khớp, sót "p 1" đầu chuỗi
+    text = _SUB_STATE_RE.sub(lambda m: m.group(1) + _SUB_OF[m.group(2)], text)
+    text = _SUB_EQ_RE.sub(lambda m: m.group(1) + _SUB_OF[m.group(2)], text)
+    return text
+
+
 def unicode_to_latex(text: str) -> str:
     r"""
     Chuyển ký hiệu Vật lý dạng Unicode trong văn bản thành LaTeX $...$ (text).
@@ -317,9 +364,11 @@ def unicode_to_latex(text: str) -> str:
     if not text:
         return text
 
-    # Khôi phục số mũ đơn vị (m/s2 → m/s²) và dấu độ (350C → 35°C) trước khi xử lý
+    # Khôi phục số mũ đơn vị (m/s2 → m/s²), dấu độ (350C → 35°C) và số mũ/chỉ số
+    # bị bẹp (105N/m2 → 10⁵N/m², p 1 = → p₁ =) trước khi xử lý
     text = _fix_unit_exponents(text)
     text = _fix_degree_zero(text)
+    text = _fix_flattened_scripts(text)
 
     units = []  # mỗi phần tử: {'s': str, 'math': bool}
 
@@ -547,8 +596,10 @@ def _mau_fix_math_expr(expr: str) -> str:
     expr = expr.replace('°', r'^\circ')
     # Đơn vị trần sau chữ số (hoặc sau ^{n}) → \text{...}
     # Lookahead chặn } (tránh re-wrap chữ cuối trong \text{...} sẵn có)
+    # và chặn _ (biến có chỉ số dưới V_{2}, p_{1}... KHÔNG phải đơn vị Volt;
+    # vẫn cho ^ vì đơn vị mang mũ m^{2}, cm^{3} phải được bọc)
     expr = re.sub(
-        r'([0-9}])\s*(' + _MAU_UNIT_ALT + r')(?![A-Za-zµμΩÀ-Ỹà-ỹ}])',
+        r'([0-9}])\s*(' + _MAU_UNIT_ALT + r')(?![A-Za-zµμΩÀ-Ỹà-ỹ}_])',
         r'\1\\text{\2}', expr)
     # Mũ 1 chữ số bỏ ngoặc cho khớp mẫu: ^{2} → ^2 (giữ ^{-3}, ^{10})
     expr = re.sub(r'\^\{([0-9])\}', r'^\1', expr)
