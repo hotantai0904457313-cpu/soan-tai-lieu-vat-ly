@@ -800,6 +800,63 @@ def api_export_word():
         return jsonify({'error': f'Lỗi xuất Word: {str(e)}'}), 500
 
 
+@app.route('/api/docx-images', methods=['POST'])
+def api_docx_images():
+    """Word bài tập → Word chỉ gồm 'Câu N.' + hình của câu đó (đã làm nét).
+    Chạy đồng bộ: không gọi AI nặng, chỉ 1 lần hỏi AI gán số câu."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'Chưa chọn file'}), 400
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({'error': 'Chưa chọn file'}), 400
+    if not f.filename.lower().endswith('.docx'):
+        return jsonify({'error': 'Chỉ nhận file Word (.docx). '
+                                 'File .doc cũ hãy mở Word và Lưu thành .docx.'}), 400
+
+    level = (request.form.get('level') or 'manh').strip()
+    base = os.path.splitext(os.path.basename(f.filename))[0]
+    safe = ''.join(c for c in base if c.isalnum() or c in ' _-').strip()[:50] or 'BaiTap'
+
+    tmp_path = os.path.join(UPLOAD_DIR, f'{uuid.uuid4().hex[:8]}.docx')
+    out_name = f'{safe}_HinhTheoCau.docx'
+    out_path = os.path.join(EXPORT_DIR, out_name)
+    f.save(tmp_path)
+    try:
+        s = get_settings()
+        from core.docx_images import extract_question_images
+        stats = extract_question_images(
+            tmp_path, out_path, title=f'HÌNH BÀI TẬP — {base}',
+            level=level,
+            gemini_key=s.get('gemini_api_key', '') if check_internet() else '',
+            niner_url=s.get('niner_router_url', ''),
+            niner_key=s.get('niner_router_key', ''))
+        stats['saved_to'] = copy_to_destinations(out_path, s)
+        stats['filename'] = out_name
+        return jsonify(stats)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': f'Lỗi xử lý file: {e}'}), 500
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+@app.route('/api/docx-images/result/<path:name>', methods=['GET'])
+def api_docx_images_result(name):
+    """Tải file kết quả (tên do endpoint trên trả về)."""
+    safe = os.path.basename(name)
+    path = os.path.join(EXPORT_DIR, safe)
+    if not os.path.exists(path):
+        return jsonify({'error': 'File không còn trên máy chủ'}), 404
+    return send_file(path, as_attachment=True, download_name=safe,
+                     mimetype='application/vnd.openxmlformats-officedocument'
+                              '.wordprocessingml.document')
+
+
 @app.route('/api/export/answer_table', methods=['POST'])
 def api_export_answer_table():
     data = request.get_json()

@@ -1613,6 +1613,96 @@ function p2wDownload(index, name) {
   a.remove();
 }
 
+// ── Tách hình theo câu (Word → Word chỉ gồm số câu + hình) ────────
+let docxImgFile = null;
+
+function openDocxImg() {
+  docxImgFile = null;
+  $('docximg-name').style.display = 'none';
+  $('docximg-name').textContent = '';
+  $('docximg-status').style.display = 'none';
+  $('docximg-status').innerHTML = '';
+  $('docximg-start-btn').disabled = true;
+  $('docximg-start-btn').textContent = '🚀 Bắt đầu tách hình';
+  const inp = $('docximg-file');
+  if (inp) inp.value = '';
+  $('docximg-modal').classList.add('show');
+}
+
+function docxImgDrop(ev) {
+  ev.preventDefault();
+  ev.currentTarget.classList.remove('drag');
+  docxImgPick(ev.dataTransfer?.files || []);
+}
+
+function docxImgPick(fileList) {
+  const f = [...fileList].find(x => x.name.toLowerCase().endsWith('.docx'));
+  if (!f) {
+    showToast('Chỉ nhận file Word .docx (file .doc cũ hãy mở Word và Lưu thành .docx)', 'error');
+    return;
+  }
+  docxImgFile = f;
+  const nameEl = $('docximg-name');
+  nameEl.textContent = '📄 ' + f.name + '  (' + (f.size / 1024 / 1024).toFixed(1) + ' MB)';
+  nameEl.style.display = 'block';
+  $('docximg-start-btn').disabled = false;
+}
+
+async function docxImgStart() {
+  if (!docxImgFile) return;
+  const fd = new FormData();
+  fd.append('file', docxImgFile);
+  fd.append('level', ($('docximg-level') || {}).value || 'manh');
+
+  const btn = $('docximg-start-btn');
+  const st = $('docximg-status');
+  btn.disabled = true;
+  btn.textContent = '⏳ Đang xử lý...';
+  st.style.display = 'block';
+  st.innerHTML = '<span style="color:var(--navy);">🔄 Đang trích hình, gán số câu và làm nét…</span>';
+
+  try {
+    const r = await fetch('/api/docx-images', { method: 'POST', body: fd });
+    let d = null;
+    try { d = await r.json(); } catch (_) { d = null; }
+    if (!r.ok || !d) {
+      const msg = (d && d.error) || (r.status === 413
+        ? 'File quá lớn — hãy tách nhỏ rồi thử lại.'
+        : 'Lỗi server (' + r.status + ')');
+      st.innerHTML = '<span style="color:#c0392b;">❌ ' + msg + '</span>';
+      btn.disabled = false;
+      btn.textContent = '🚀 Bắt đầu tách hình';
+      return;
+    }
+    const cach = d.phuong_phap === 'ai' ? 'AI gán số câu' : 'nhận diện cục bộ (AI không dùng được)';
+    let html = `<div style="color:#1e7e34;font-weight:600;">✅ Xong: ${d.so_cau} câu · ${d.so_hinh} hình (${cach})</div>`;
+    if (d.hinh_trong_bang)
+      html += `<div style="color:#9a5b00;margin-top:6px;">⚠ Có ${d.hinh_trong_bang} hình nằm trong bảng — chưa lấy theo cài đặt hiện tại.</div>`;
+    if (d.hinh_loi)
+      html += `<div style="color:#9a5b00;margin-top:6px;">⚠ ${d.hinh_loi} hình không đọc được (định dạng EMF/WMF của Word).</div>`;
+    if (d.saved_to && d.saved_to.length)
+      html += `<div style="color:var(--text-muted);margin-top:6px;font-size:12px;">Đã lưu vào: ${d.saved_to.join(' · ')}</div>`;
+    html += `<button class="btn btn-primary" style="margin-top:10px;" onclick="docxImgDownload('${d.filename.replace(/'/g, '')}')">⬇ Tải file Word</button>`;
+    st.innerHTML = html;
+    showToast(`Đã tách ${d.so_hinh} hình của ${d.so_cau} câu`, 'success', 4000);
+    btn.textContent = '🚀 Tách file khác';
+    btn.disabled = false;
+  } catch (e) {
+    st.innerHTML = '<span style="color:#c0392b;">❌ Lỗi kết nối: ' + e.message + '</span>';
+    btn.disabled = false;
+    btn.textContent = '🚀 Bắt đầu tách hình';
+  }
+}
+
+function docxImgDownload(name) {
+  const a = document.createElement('a');
+  a.href = '/api/docx-images/result/' + encodeURIComponent(name);
+  a.download = name || '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 // ── PDF → Markdown (OCR Gemini cho NotebookLM) ────────────────────
 let p2mdPending = [];
 let p2mdJobId = null;

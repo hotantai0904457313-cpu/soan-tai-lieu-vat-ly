@@ -41,6 +41,11 @@
     📄→📑 PDF sang Markdown
   </button>
 
+  <button class="tb-btn" onclick="openDocxImg()"
+          title="Word bài tập → file Word chỉ gồm số câu + hình của câu đó, đã làm nét">
+    🖼 Tách hình theo câu
+  </button>
+
   <div class="tb-sep"></div>
 
   <button class="tb-btn" onclick="saveDocument()">💾 Lưu</button>
@@ -422,6 +427,58 @@
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal('p2md-modal')">Dong</button>
       <button class="btn btn-primary" id="p2md-start-btn" onclick="p2mdStart()" disabled>&#128640; Bat dau OCR</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODAL TÁCH HÌNH THEO CÂU (Word) ══════════════════════════ -->
+<div class="modal-overlay" id="docximg-modal">
+  <div class="modal-box" style="max-width:640px;">
+    <div class="modal-header">
+      🖼 Tách hình theo câu (từ file Word)
+      <button onclick="closeModal('docximg-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="docximg-dropzone"
+           onclick="document.getElementById('docximg-file').click()"
+           ondragover="event.preventDefault();this.classList.add('drag')"
+           ondragleave="this.classList.remove('drag')"
+           ondrop="docxImgDrop(event)"
+           style="border:2px dashed var(--navy);border-radius:8px;padding:22px;text-align:center;
+                  cursor:pointer;background:var(--navy-light);transition:.15s;">
+        <input type="file" id="docximg-file" accept=".docx" style="display:none"
+               onchange="docxImgPick(this.files)">
+        <div style="font-size:14px;font-weight:600;color:var(--navy);">📥 Kéo thả file Word bài tập vào đây, hoặc bấm để chọn</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:6px;">
+          Làm nét từng hình · file ra chỉ gồm <strong>Câu N.</strong> + hình của câu đó (bỏ nội dung chữ)
+        </div>
+      </div>
+
+      <div id="docximg-name" style="margin-top:12px;font-size:13px;color:var(--navy);
+           font-weight:600;display:none;"></div>
+
+      <div style="margin-top:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span style="font-size:12px;font-weight:600;">Mức làm nét:</span>
+        <select id="docximg-level" style="padding:5px 8px;border:1.5px solid var(--navy);
+                border-radius:6px;font-size:12px;font-family:inherit;">
+          <option value="nhe">Nhẹ — ảnh vốn đã rõ</option>
+          <option value="vua">Vừa phải</option>
+          <option value="manh" selected>Mạnh — ảnh scan mờ (mặc định)</option>
+        </select>
+      </div>
+
+      <div id="docximg-status" style="display:none;margin-top:14px;font-size:13px;"></div>
+
+      <div style="background:var(--navy-light);border-radius:6px;padding:10px 12px;font-size:12px;
+                  color:var(--navy);margin-top:14px;line-height:1.6;">
+        &#x2139; AI (Gemini/9Router theo Cài đặt) dùng để <strong>gán đúng số câu</strong> cho từng hình.
+        Việc làm nét do máy xử lý cục bộ nên <strong>nội dung hình không bị vẽ lại</strong>.
+        Hình nằm trong bảng sẽ được báo số lượng nhưng không lấy.
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('docximg-modal')">Đóng</button>
+      <button class="btn btn-primary" id="docximg-start-btn" onclick="docxImgStart()" disabled>🚀 Bắt đầu tách hình</button>
     </div>
   </div>
 </div>
