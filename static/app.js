@@ -350,6 +350,7 @@ function renderEditorPanel(doc, opts = {}) {
     updateUnsavedIndicator();
   }
   updateDocInfoBadge();
+  loadCurriculum().then(updateScopeChip);   // chip phạm vi theo tài liệu đang mở
 
   // Bật nút "Thông tin" khi có tài liệu
   const btnInfo = $('btn-doc-info');
@@ -907,6 +908,149 @@ async function openDocument(docId) {
   }
 }
 
+// ── Phạm vi kiến thức ràng buộc AI giải bài ──────────────────────
+let curriculumTree = null;   // {"10": {ten, chuong:[{id,ten}]}, ...}
+let scopeDraft = { mode: 'khong_rang_buoc' };
+
+function currentScope() {
+  return (state.currentDoc && state.currentDoc.ai_scope) || { mode: 'khong_rang_buoc' };
+}
+
+function updateScopeChip() {
+  const chip = $('scope-chip');
+  if (!chip) return;
+  const s = currentScope();
+  let label = 'Không ràng buộc';
+  if (s.mode === 'tuy_chinh') {
+    label = 'Tùy chỉnh';
+  } else if (s.mode === 'chuong_trinh' && s.grade) {
+    const g = curriculumTree && curriculumTree[String(s.grade)];
+    const ch = g && g.chuong.find(c => c.id === s.chapter_id);
+    label = 'Lớp ' + s.grade + (ch ? ' · ' + (s.cumulative === false ? 'chỉ ' : '') + ch.ten : '');
+  }
+  chip.textContent = '⚙ Phạm vi: ' + label;
+  const on = s.mode === 'chuong_trinh' || s.mode === 'tuy_chinh';
+  chip.style.background = on ? '#0f766e' : '';
+  chip.style.color = on ? '#fff' : '';
+  chip.style.borderColor = on ? '#0f766e' : '';
+}
+
+async function loadCurriculum() {
+  if (curriculumTree) return curriculumTree;
+  try {
+    const r = await fetch('/api/curriculum');
+    curriculumTree = await r.json();
+  } catch (e) {
+    curriculumTree = {};
+  }
+  return curriculumTree;
+}
+
+async function openScopeModal() {
+  if (!state.currentDoc) { showToast('Chưa có tài liệu', 'warning'); return; }
+  await loadCurriculum();
+
+  const s = currentScope();
+  scopeDraft = JSON.parse(JSON.stringify(s));
+
+  // Nạp dropdown lớp
+  const gSel = $('scope-grade');
+  gSel.innerHTML = '';
+  Object.keys(curriculumTree).forEach(g => {
+    const o = document.createElement('option');
+    o.value = g; o.textContent = curriculumTree[g].ten;
+    gSel.appendChild(o);
+  });
+  // Mặc định theo lớp của tài liệu nếu chưa từng đặt phạm vi
+  const gradeInit = s.grade || state.currentDoc.grade || Object.keys(curriculumTree)[0];
+  gSel.value = String(gradeInit);
+  fillScopeChapters(String(gradeInit), s.chapter_id);
+
+  $('scope-only-chapter').checked = s.cumulative === false;
+  $('scope-allow').value = s.allow || '';
+  $('scope-deny').value = s.deny || '';
+
+  scopeSetMode(s.mode || 'khong_rang_buoc');
+  $('scope-modal').classList.add('show');
+}
+
+function fillScopeChapters(grade, selectedId) {
+  const cSel = $('scope-chapter');
+  cSel.innerHTML = '';
+  const g = curriculumTree[grade];
+  if (!g) return;
+  g.chuong.forEach(c => {
+    const o = document.createElement('option');
+    o.value = c.id; o.textContent = c.ten;
+    cSel.appendChild(o);
+  });
+  // Chưa chọn → mặc định chương cuối (đã học hết lớp)
+  cSel.value = (selectedId && g.chuong.some(c => c.id === selectedId))
+    ? selectedId : g.chuong[g.chuong.length - 1].id;
+}
+
+function scopeOnGradeChange() {
+  fillScopeChapters($('scope-grade').value, null);
+  scopePreview();
+}
+
+function scopeSetMode(mode) {
+  scopeDraft.mode = mode;
+  ['khong_rang_buoc', 'chuong_trinh', 'tuy_chinh'].forEach(m => {
+    const el = $('scope-opt-' + m);
+    if (el) el.classList.toggle('active', m === mode);
+  });
+  $('scope-ct-box').style.display     = mode === 'chuong_trinh' ? 'block' : 'none';
+  $('scope-custom-box').style.display = mode === 'tuy_chinh'    ? 'block' : 'none';
+  scopePreview();
+}
+
+function scopeCollect() {
+  const mode = scopeDraft.mode || 'khong_rang_buoc';
+  if (mode === 'chuong_trinh') {
+    return { mode, grade: parseInt($('scope-grade').value),
+             chapter_id: $('scope-chapter').value,
+             cumulative: !$('scope-only-chapter').checked };
+  }
+  if (mode === 'tuy_chinh') {
+    return { mode, allow: $('scope-allow').value.trim(), deny: $('scope-deny').value.trim() };
+  }
+  return { mode: 'khong_rang_buoc' };
+}
+
+let scopePreviewTimer = null;
+function scopePreview() {
+  const wrap = $('scope-preview-wrap');
+  const scope = scopeCollect();
+  if (scope.mode === 'khong_rang_buoc') { wrap.style.display = 'none'; return; }
+  clearTimeout(scopePreviewTimer);
+  scopePreviewTimer = setTimeout(async () => {
+    try {
+      const r = await fetch('/api/curriculum/preview', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope }),
+      });
+      const d = await r.json();
+      if (d.text) {
+        $('scope-preview').textContent = d.text;
+        wrap.style.display = 'block';
+      } else {
+        wrap.style.display = 'none';
+      }
+    } catch (e) { wrap.style.display = 'none'; }
+  }, 250);
+}
+
+function scopeSave() {
+  if (!state.currentDoc) return;
+  state.currentDoc.ai_scope = scopeCollect();
+  markUnsaved();
+  updateScopeChip();
+  closeModal('scope-modal');
+  showToast('Đã áp dụng phạm vi: ' + $('scope-chip').textContent.replace('⚙ Phạm vi: ', ''),
+            'success');
+}
+
 // ── AI Giải bài ───────────────────────────────────────────────────
 async function solveAll() {
   if (!state.currentDoc) { showToast('Chưa có tài liệu', 'warning'); return; }
@@ -1027,6 +1171,8 @@ async function solveOne(q, card, btn) {
   // Tạo doc tạm chỉ có 1 section với 1 câu
   const miniDoc = {
     title: state.currentDoc?.title || '',
+    // Giữ phạm vi kiến thức — thiếu dòng này thì giải từng câu mất ràng buộc
+    ai_scope: state.currentDoc?.ai_scope || {},
     sections: [{ id: 'tmp', type: 'khac', label: '', intro: '',
                   questions: [q], is_theory: false }]
   };

@@ -56,7 +56,13 @@ def _build_full_prompt(doc: Document) -> tuple[str, dict]:
     Đánh số [CÂU n] TOÀN CỤC liên tục qua mọi phần — số câu trong đề thi
     chuẩn reset về 1 ở đầu mỗi phần (Phần I câu 1-18, Phần II câu 1-4...)
     nên q.number trùng nhau giữa các phần, không dùng làm khóa map được."""
+    from core.chuong_trinh import build_scope_prompt, REMINDER
+
+    scope_text = build_scope_prompt(getattr(doc, 'ai_scope', None))
     lines = []
+    if scope_text:
+        lines.append(scope_text)
+        lines.append('\n=== ĐỀ BÀI CẦN GIẢI ===')
     num_to_id = {}
     gnum = 0
 
@@ -79,6 +85,8 @@ def _build_full_prompt(doc: Document) -> tuple[str, dict]:
                 for sub in q.sub_items:
                     lines.append(f"  {sub}")
 
+    if scope_text:
+        lines.append(REMINDER)
     return "\n".join(lines), num_to_id
 
 
@@ -320,7 +328,7 @@ Trả về ĐÚNG định dạng (KHÔNG thêm text ngoài, KHÔNG ghi <thinking
 
 def _vision_solve_one(q: Question, model: str,
                       niner_key: str = '', niner_url: str = 'http://localhost:20128/v1',
-                      gemini_key: str = '') -> str | None:
+                      gemini_key: str = '', scope_text: str = '') -> str | None:
     """Giải 1 câu CÓ HÌNH bằng Vision (gửi kèm ảnh). Trả lời giải hoặc None."""
     import os, base64
     from config import UPLOAD_DIR
@@ -342,6 +350,10 @@ def _vision_solve_one(q: Question, model: str,
         qtext += "\n" + "\n".join(q.options)
     if q.sub_items:
         qtext += "\n" + "\n".join(q.sub_items)
+    # Ràng buộc phạm vi phải đi kèm cả đường Vision — câu có đồ thị được giải
+    # lại bằng Vision và ĐÈ lên đáp án text, bỏ sót là vỡ ràng buộc
+    if scope_text:
+        qtext = scope_text + '\n\n=== CÂU HỎI ===\n' + qtext
 
     def _via_router(mdl):
         from openai import OpenAI
@@ -402,15 +414,19 @@ def _solve_image_questions(doc: Document, model: str,
                            gemini_key: str = '') -> dict:
     """Giải SONG SONG mọi câu có hình bằng Vision. Trả {q_id: solution}."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from core.chuong_trinh import build_scope_prompt
+
     img_qs = [q for s in doc.sections if not s.is_theory
               for q in s.questions if q.images]
     if not img_qs:
         return {}
+    scope_text = build_scope_prompt(getattr(doc, 'ai_scope', None))
     results = {}
 
     def _work(q):
         try:
-            return q.id, _vision_solve_one(q, model, niner_key, niner_url, gemini_key)
+            return q.id, _vision_solve_one(q, model, niner_key, niner_url,
+                                           gemini_key, scope_text)
         except Exception:
             return q.id, None
 

@@ -815,6 +815,19 @@ body {
 #p2w-dropzone.drag,
 #p2md-dropzone.drag,
 #docximg-dropzone.drag { background: #dde9fb; border-color: var(--accent); }
+
+/* ── Phạm vi kiến thức (modal chọn chế độ) ─────────────────── */
+.scope-opts { display: flex; flex-direction: column; gap: 8px; }
+.scope-opt {
+  border: 1.5px solid var(--border); border-radius: 8px;
+  padding: 10px 14px; cursor: pointer; transition: .15s;
+}
+.scope-opt:hover { border-color: var(--navy); background: var(--navy-light); }
+.scope-opt strong { display: block; font-size: 13.5px; color: var(--navy); }
+.scope-opt span { font-size: 12px; color: var(--text-muted); }
+.scope-opt.active { background: #0f766e; border-color: #0f766e; }
+.scope-opt.active strong,
+.scope-opt.active span { color: #fff; }
 .p2w-row {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 12px; background: var(--white);

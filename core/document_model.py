@@ -128,6 +128,8 @@ class Document:
     semester: str = ''
     doc_type: str = 'khac'
     sections: List[Section] = field(default_factory=list)
+    # Phạm vi kiến thức ràng buộc AI khi giải bài — xem core/chuong_trinh.py
+    ai_scope: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict:
         return {
@@ -138,6 +140,7 @@ class Document:
             'chapter': self.chapter,
             'semester': self.semester,
             'doc_type': self.doc_type,
+            'ai_scope': self.ai_scope,
             'sections': [s.to_dict() for s in self.sections],
         }
 
@@ -154,6 +157,7 @@ class Document:
             chapter=d.get('chapter', ''),
             semester=d.get('semester', ''),
             doc_type=d.get('doc_type', 'khac'),
+            ai_scope=d.get('ai_scope') or {},   # tài liệu cũ không có field này
         )
         doc.sections = [Section.from_dict(s) for s in d.get('sections', [])]
         return doc

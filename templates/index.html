@@ -184,6 +184,8 @@
                 onclick="solveAll()">🤖 Giải toàn đề</button>
         <button class="tb-btn ai-btn" style="background:#6b21a8;color:#fff;border-color:#6b21a8;"
                 onclick="reviewDoc()">🔍 Nhận xét đề</button>
+        <button class="tb-btn ai-btn" id="scope-chip" onclick="openScopeModal()"
+                title="Giới hạn kiến thức AI được dùng khi giải — để lời giải đúng tầm học sinh đã học">⚙ Phạm vi: Không ràng buộc</button>
         <div class="ai-spinner" id="ai-spinner"></div>
         <div id="ai-status-text" style="font-size:12px;color:var(--text-muted);"></div>
         <button onclick="toggleAIPanel()" style="margin-left:auto;background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:13px;" title="Thu/mở panel AI">▼</button>
@@ -427,6 +429,86 @@
     <div class="modal-footer">
       <button class="btn btn-secondary" onclick="closeModal('p2md-modal')">Dong</button>
       <button class="btn btn-primary" id="p2md-start-btn" onclick="p2mdStart()" disabled>&#128640; Bat dau OCR</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODAL PHẠM VI KIẾN THỨC (ràng buộc AI giải bài) ══════════ -->
+<div class="modal-overlay" id="scope-modal">
+  <div class="modal-box" style="max-width:700px;">
+    <div class="modal-header">
+      ⚙ Phạm vi kiến thức khi AI giải bài
+      <button onclick="closeModal('scope-modal')">✕</button>
+    </div>
+    <div class="modal-body">
+
+      <div class="scope-opts">
+        <div class="scope-opt" id="scope-opt-khong_rang_buoc" onclick="scopeSetMode('khong_rang_buoc')">
+          <strong>Không ràng buộc</strong>
+          <span>AI dùng mọi cách giải phù hợp (như hiện nay).</span>
+        </div>
+        <div class="scope-opt" id="scope-opt-chuong_trinh" onclick="scopeSetMode('chuong_trinh')">
+          <strong>Theo chương trình / GDPT 2018</strong>
+          <span>Chọn lớp và chương học sinh đã học đến.</span>
+        </div>
+        <div class="scope-opt" id="scope-opt-tuy_chinh" onclick="scopeSetMode('tuy_chinh')">
+          <strong>Ràng buộc tùy chỉnh</strong>
+          <span>Tự quy định kiến thức được dùng và không được dùng.</span>
+        </div>
+      </div>
+
+      <!-- Theo chương trình -->
+      <div id="scope-ct-box" style="display:none;margin-top:16px;">
+        <div style="display:grid;grid-template-columns:1fr 1.6fr;gap:12px;">
+          <div class="form-group" style="margin-bottom:0;">
+            <label>Lớp</label>
+            <select id="scope-grade" onchange="scopeOnGradeChange()"></select>
+          </div>
+          <div class="form-group" style="margin-bottom:0;">
+            <label>Chương (học đến hết chương này)</label>
+            <select id="scope-chapter" onchange="scopePreview()"></select>
+          </div>
+        </div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;margin-top:12px;">
+          <input type="checkbox" id="scope-only-chapter" onchange="scopePreview()" style="accent-color:var(--navy)">
+          <span>Chỉ dùng kiến thức <strong>trong chương đã chọn</strong> (không lũy tiến từ các chương/lớp trước)</span>
+        </label>
+      </div>
+
+      <!-- Tùy chỉnh -->
+      <div id="scope-custom-box" style="display:none;margin-top:16px;">
+        <div class="form-group">
+          <label>Kiến thức ĐƯỢC dùng</label>
+          <textarea id="scope-allow" rows="3" style="width:100%;font-family:inherit;font-size:13px;
+                    padding:8px;border:1.5px solid var(--border);border-radius:6px;"
+                    placeholder="VD: định luật bảo toàn động lượng, va chạm mềm, động năng"
+                    oninput="scopePreview()"></textarea>
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label>Kiến thức KHÔNG được dùng</label>
+          <textarea id="scope-deny" rows="3" style="width:100%;font-family:inherit;font-size:13px;
+                    padding:8px;border:1.5px solid var(--border);border-radius:6px;"
+                    placeholder="VD: bảo toàn cơ năng, đạo hàm, tích phân"
+                    oninput="scopePreview()"></textarea>
+        </div>
+      </div>
+
+      <div id="scope-preview-wrap" style="display:none;margin-top:16px;">
+        <label style="font-size:12px;font-weight:600;color:var(--navy);">Đoạn ràng buộc sẽ gửi cho AI:</label>
+        <pre id="scope-preview" style="margin-top:6px;max-height:210px;overflow:auto;background:var(--navy-light);
+             border-radius:6px;padding:10px 12px;font-size:11.5px;line-height:1.55;white-space:pre-wrap;
+             font-family:'Segoe UI',sans-serif;color:var(--navy);"></pre>
+      </div>
+
+      <div style="background:var(--navy-light);border-radius:6px;padding:10px 12px;font-size:12px;
+                  color:var(--navy);margin-top:14px;line-height:1.6;">
+        &#x2139; Phạm vi được lưu kèm tài liệu. Gặp bài buộc phải vượt phạm vi, AI <strong>vẫn giải</strong>
+        và ghi thêm dòng <strong>⚠ Ngoài phạm vi</strong> để thầy biết mà cân nhắc sửa đề.
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal('scope-modal')">Hủy</button>
+      <button class="btn btn-primary" onclick="scopeSave()">💾 Áp dụng</button>
     </div>
   </div>
 </div>

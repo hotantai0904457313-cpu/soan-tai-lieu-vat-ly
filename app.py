@@ -576,6 +576,22 @@ def api_ai_review():
     return jsonify({'review': review})
 
 
+@app.route('/api/curriculum', methods=['GET'])
+def api_curriculum():
+    """Cây chương trình Vật lí (lớp → chương) cho dropdown chọn phạm vi kiến thức."""
+    from core.chuong_trinh import get_curriculum_tree
+    return jsonify(get_curriculum_tree())
+
+
+@app.route('/api/curriculum/preview', methods=['POST'])
+def api_curriculum_preview():
+    """Xem trước đúng đoạn ràng buộc sẽ gửi cho AI (hiện trong modal Phạm vi)."""
+    data = request.get_json(force=True, silent=True) or {}
+    from core.chuong_trinh import build_scope_prompt, describe_scope
+    scope = data.get('scope') or {}
+    return jsonify({'text': build_scope_prompt(scope), 'label': describe_scope(scope)})
+
+
 @app.route('/api/ai/history', methods=['GET'])
 def api_ai_history():
     doc_id = request.args.get('document_id', type=int)
