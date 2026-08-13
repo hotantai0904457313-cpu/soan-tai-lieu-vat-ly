@@ -8,7 +8,9 @@ from typing import Optional
 from core.document_model import Document, Section, Question
 from config import LOGO_PATH
 
-MATH_RE = re.compile(r'\$([^$]+?)\$')
+# Bắt CẢ $$...$$ (display) lẫn $...$ (inline) — display đặt trước để không bị
+# cắt nhầm thành 2 mảnh, để sót dấu $ trơ trọi trong PDF.
+MATH_RE = re.compile(r'\$\$(.+?)\$\$|\$([^$]+?)\$', re.DOTALL)
 
 # Cache PNG công thức theo (expr, fontsize) — đề dài lặp lại nhiều công thức
 # giống nhau, mỗi lần render matplotlib tốn kém (khởi tạo figure ~chục ms).
@@ -62,17 +64,26 @@ def _math_paragraph(text: str, style, tmp_dir: str, fontsize: float = 11, prefix
     Chuyển text có $...$ thành Paragraph với ảnh inline cho mỗi công thức.
     prefix: HTML markup ghép vào đầu (ví dụ '<i>Lời giải: </i>').
     Trả về list flowable (thường là 1 Paragraph).
+
+    BẤT BIẾN: file PDF là bản học sinh cầm trên tay — không được để lọt bất kỳ
+    lệnh LaTeX thô nào. Ba lớp bảo vệ: (1) normalize_latex chuẩn hoá delimiter
+    \\(..\\) \\[..\\] và vá dấu $ lẻ; (2) công thức trong $ → ảnh; (3) mọi thứ
+    còn sót — kể cả LaTeX AI quên bọc $ — hạ xuống Unicode qua plain_if_latex.
     """
     from reportlab.platypus import Paragraph
+    from core.latex_normalize import normalize_latex, latex_to_plain, plain_if_latex
+
+    text = normalize_latex(text or '')
 
     if '$' not in text:
-        return [Paragraph(prefix + _xml(text), style)]
+        # Không có công thức bọc $ — nhưng AI vẫn có thể viết LaTeX trần
+        return [Paragraph(prefix + _xml(plain_if_latex(text)), style)]
 
     markup = prefix
     last = 0
     for m in MATH_RE.finditer(text):
-        markup += _xml(text[last:m.start()])
-        expr = m.group(1)
+        markup += _xml(plain_if_latex(text[last:m.start()]))
+        expr = m.group(1) or m.group(2) or ''
         result = _render_latex(expr, fontsize)
         if result:
             png, w_pt, h_pt = result
@@ -88,10 +99,10 @@ def _math_paragraph(text: str, style, tmp_dir: str, fontsize: float = 11, prefix
             h_s = max(h_s, fontsize * 1.2)
             markup += f'<img src="{fname}" width="{w_s:.1f}" height="{h_s:.1f}" valign="middle"/>'
         else:
-            # Fallback: hiển thị công thức dạng text đơn giản
-            markup += f'<i>{_xml(expr)}</i>'
+            # Render lỗi → hạ xuống Unicode đọc được, KHÔNG in LaTeX thô
+            markup += f'<i>{_xml(latex_to_plain(expr))}</i>'
         last = m.end()
-    markup += _xml(text[last:])
+    markup += _xml(plain_if_latex(text[last:]))
     return [Paragraph(markup, style)]
 
 IMG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'uploads', 'images')
@@ -232,13 +243,11 @@ def export_pdf(doc: Document, output_path: str, show_solutions: bool = True, set
             for q in section.questions:
                 q_block = []
 
-                # Câu hỏi — nếu có $...$ thì dùng _math_paragraph
+                # Câu hỏi — LUÔN qua _math_paragraph: LaTeX có thể xuất hiện cả
+                # khi không có dấu $ (AI/file gốc viết \frac, \sqrt trần)
                 q_prefix = f'<b>Câu {q.number}.</b> '
-                if '$' in q.text:
-                    q_block.extend(_math_paragraph(q.text, style_q_math, tmp_dir,
-                                                    fontsize=12, prefix=q_prefix))
-                else:
-                    q_block.append(Paragraph(q_prefix + _xml(q.text), style_q))
+                q_block.extend(_math_paragraph(q.text, style_q_math, tmp_dir,
+                                               fontsize=12, prefix=q_prefix))
 
                 # Hình ảnh câu hỏi
                 for img in q.images:
@@ -254,16 +263,17 @@ def export_pdf(doc: Document, output_path: str, show_solutions: bool = True, set
                         except Exception:
                             pass
 
-                # Options A/B/C/D — bố cục 2 cột
+                # Options A/B/C/D — bố cục 2 cột (đáp án cũng có thể chứa công thức)
+                def _opt_para(s):
+                    return _math_paragraph(s, style_opt, tmp_dir, fontsize=12)[0]
+
                 if q.options:
                     opts = q.options
                     if len(opts) == 4:
                         col_w = CONTENT_W / 2
                         tdata = [
-                            [Paragraph(_xml(opts[0]), style_opt),
-                             Paragraph(_xml(opts[1]), style_opt)],
-                            [Paragraph(_xml(opts[2]), style_opt),
-                             Paragraph(_xml(opts[3]), style_opt)],
+                            [_opt_para(opts[0]), _opt_para(opts[1])],
+                            [_opt_para(opts[2]), _opt_para(opts[3])],
                         ]
                         t = Table(tdata, colWidths=[col_w, col_w])
                         t.setStyle(TableStyle([
@@ -274,14 +284,11 @@ def export_pdf(doc: Document, output_path: str, show_solutions: bool = True, set
                         q_block.append(t)
                     else:
                         for opt in opts:
-                            q_block.append(Paragraph(_xml(opt), style_opt))
+                            q_block.append(_opt_para(opt))
 
                 # Sub-items (đúng-sai a/b/c/d)
                 for sub in q.sub_items:
-                    if '$' in sub:
-                        q_block.extend(_math_paragraph(sub, style_sub, tmp_dir, fontsize=12))
-                    else:
-                        q_block.append(Paragraph(_xml(sub), style_sub))
+                    q_block.extend(_math_paragraph(sub, style_sub, tmp_dir, fontsize=12))
 
                 # Lời giải
                 if show_solutions and q.show_solution and q.ai_solution:
@@ -377,12 +384,11 @@ _CELL_SUP = {'^{2}': '²', '^2': '²', '^{3}': '³', '^3': '³', '^{-1}': '⁻¹
 
 
 def _clean_table_cell(s: str) -> str:
-    """Làm sạch ô bảng trước khi vẽ matplotlib: bỏ $ (mathtext dễ lỗi với \\text,
-    tiếng Việt trong công thức → hỏng cả bảng), gỡ \\text{...}, mũ → ký tự Unicode."""
-    s = re.sub(r'\\text\{([^{}]*)\}', r'\1', str(s))
-    for k, v in _CELL_SUP.items():
-        s = s.replace(k, v)
-    return s.replace('$', '').strip()
+    """Làm sạch ô bảng trước khi vẽ matplotlib: mathtext dễ lỗi với tiếng Việt
+    trong công thức → hỏng cả bảng. Hạ trọn về Unicode qua latex_to_plain
+    (một nguồn sự thật, dùng chung với đường PDF)."""
+    from core.latex_normalize import latex_to_plain
+    return latex_to_plain(str(s)).strip()
 
 
 def _render_table_png(rows, tmp_dir: str, dpi: int = 160):

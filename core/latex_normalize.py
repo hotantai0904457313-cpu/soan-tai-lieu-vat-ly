@@ -689,3 +689,159 @@ def to_mau_standard(text: str) -> str:
         else:
             out.append(_mau_fix_plain(part))
     return ''.join(out)
+
+
+# ── LaTeX → chữ Unicode đọc được (cho đường xuất PDF) ────────────────
+# BẤT BIẾN: LaTeX $...$ CHỈ dành cho đường xuất WORD (add-in AIOMT chuyển
+# thành công thức thật). Mọi đường khác — nhất là PDF — phải render thành
+# hình hoặc hạ xuống ký tự đọc được; TUYỆT ĐỐI không để lọt \frac, \sqrt,
+# \text vào file học sinh cầm trên tay.
+
+_LATEX_TO_SYM = {}          # '\alpha' -> 'α'  (đảo _GREEK và _SYM)
+for _u, _l in list(_GREEK.items()) + list(_SYM.items()):
+    _LATEX_TO_SYM.setdefault(_l, _u)
+_LATEX_TO_SYM[r'\circ'] = '°'
+_LATEX_TO_SYM[r'\sqrt{}'] = '√'
+_LATEX_TO_SYM[r'\ '] = ' '
+_LATEX_TO_SYM[r'\,'] = ' '
+_LATEX_TO_SYM[r'\;'] = ' '
+_LATEX_TO_SYM[r'\!'] = ''
+# Khớp lệnh DÀI trước (\varphi trước \phi, \Rightarrow trước \rightarrow)
+_LATEX_SYM_RE = re.compile(
+    '|'.join(re.escape(k) for k in sorted(_LATEX_TO_SYM, key=len, reverse=True)))
+
+# CHỈ dùng chữ số và dấu — ký tự mũ/chỉ số dạng CHỮ (ₘ ₐ ₓ ⁿ) thiếu glyph
+# trong Times New Roman → PDF hiện ô vuông. Chữ giữ dạng ^n / _max cho chắc.
+_SUP_CHARS = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵',
+              '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻',
+              '°': '°'}
+_SUB_CHARS = {'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅',
+              '6': '₆', '7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋'}
+
+_GREEK_CHARS = set(_GREEK)      # {'α','β','Δ',...} — chữ cái, khác toán tử
+
+# Ký tự đã là mũ/chỉ số — tính là "một hạng tử đơn" khi cân nhắc thêm ngoặc.
+# ¹²³ nằm ở Latin-1 (U+00B9/B2/B3), TÁCH RỜI khối ⁰⁴-⁹ (U+2070+) → phải liệt kê.
+# Gồm cả ^ _ vì bước phân số chạy TRƯỚC bước đổi mũ/chỉ số: lúc đó "v_0^2"
+# vẫn còn dạng thô, thiếu chúng thì bị bọc ngoặc thừa → "(v₀²)/2g".
+_SIMPLE_TERM = r'[0-9A-Za-zÀ-Ỹà-ỹ₀-₉⁰-⁹¹²³°.,⃗^_]+'
+
+# Có dấu hiệu LaTeX thật (lệnh \abc, ^{..}, _{..}) — dùng để biết đoạn text
+# thường có lẫn LaTeX trần (AI đôi khi quên bọc $)
+_HAS_LATEX_RE = re.compile(r'\\[A-Za-z]{2,}|\\[\[\]()]|[\^_]\{')
+
+
+def has_latex(text: str) -> bool:
+    """True nếu đoạn text còn lệnh LaTeX (kể cả khi không có dấu $)."""
+    return bool(text) and bool(_HAS_LATEX_RE.search(text))
+
+
+def _script_chars(s: str, table: dict) -> str | None:
+    """Đổi chuỗi sang ký tự mũ/chỉ số Unicode; None nếu có ký tự không đổi được."""
+    out = []
+    for ch in s:
+        if ch in table:
+            out.append(table[ch])
+        elif ch == ' ':
+            continue
+        else:
+            return None
+    return ''.join(out)
+
+
+def latex_to_plain(expr: str) -> str:
+    r"""Hạ biểu thức LaTeX xuống chữ Unicode đọc được — lưới an toàn cho PDF.
+
+    \frac{v_0^2}{2g} → v₀²/2g · \sqrt{2gh} → √(2gh) · \text{m/s} → m/s
+    25^\circ\text{C} → 25°C · \vec{F} → F⃗ · \alpha → α · \times → ×
+    """
+    if not expr:
+        return ''
+    s = expr
+
+    # 1) Bỏ delimiter còn sót
+    s = s.replace('$$', '').replace('$', '')
+    s = re.sub(r'\\[\[\]()]', '', s)
+    s = re.sub(r'\\(?:left|right|big|Big|bigg|Bigg)\s*', '', s)
+
+    # 2) Gỡ lớp bọc chữ thường: \text{...} \mathrm{...} \mathbf{...}
+    for _ in range(4):
+        s2 = re.sub(r'\\(?:text|textbf|textit|mathrm|mathbf|mathit|mathsf|operatorname)'
+                    r'\s*\{([^{}]*)\}', r'\1', s)
+        if s2 == s:
+            break
+        s = s2
+
+    # 3) Vectơ: \vec{F} → F⃗ (dấu mũi tên tổ hợp, hiển thị đúng trên PDF)
+    for _ in range(3):
+        s2 = re.sub(r'\\(?:vec|overrightarrow)\s*\{([^{}]*)\}', '\\1\u20d7', s)
+        if s2 == s:
+            break
+        s = s2
+
+    # 4) Căn: \sqrt[3]{x} → ∛(x) · \sqrt{x} → √x (bỏ ngoặc khi chỉ 1 hạng tử)
+    def _sqrt(m):
+        idx, body = m.group(1), m.group(2)
+        sym = {'3': '∛', '4': '∜'}.get((idx or '').strip(), '√')
+        simple = re.fullmatch(_SIMPLE_TERM, body or '')
+        return sym + (body if simple else '(' + body + ')')
+    for _ in range(4):
+        s2 = re.sub(r'\\sqrt\s*(?:\[([^\]]*)\])?\s*\{([^{}]*)\}', _sqrt, s)
+        if s2 == s:
+            break
+        s = s2
+
+    # 5) Phân số: \frac{a}{b} → a/b, thêm ngoặc khi tử/mẫu có nhiều hạng tử
+    def _frac(m):
+        a, b = m.group(1).strip(), m.group(2).strip()
+        wrap = lambda x: x if re.fullmatch(_SIMPLE_TERM, x) else '(' + x + ')'
+        return wrap(a) + '/' + wrap(b)
+    for _ in range(5):
+        s2 = re.sub(r'\\(?:d|t)?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}', _frac, s)
+        if s2 == s:
+            break
+        s = s2
+
+    # 6) Ký hiệu & chữ Hy Lạp (khớp lệnh dài trước).
+    #    Khoảng trắng sau lệnh là dấu KẾT THÚC TÊN LỆNH, không phải space thật:
+    #    "\Delta U" nghĩa là ΔU chứ không phải "Δ U". Nhưng "\alpha + \beta"
+    #    thì space quanh toán tử là thật → chỉ nuốt khi ký tự kế là chữ/số.
+    def _sym(m):
+        rep = _LATEX_TO_SYM[m.group(0)]
+        nxt = m.string[m.end():]
+        # CHỈ nuốt sau chữ cái Hy Lạp (\Delta U → ΔU). Toán tử thì space là
+        # thật và phải giữ: "\times 10" → "× 10", "\geq 5" → "≥ 5"
+        if rep in _GREEK_CHARS and nxt[:1] == ' ' and nxt[1:2].isalnum():
+            return rep + '\x00'          # đánh dấu space cần nuốt
+        return rep
+    s = _LATEX_SYM_RE.sub(_sym, s)
+    s = re.sub(r'\x00 ?', '', s)
+
+    # 7) Mũ / chỉ số → ký tự Unicode; không đổi được thì giữ ^ _ cho dễ đọc
+    def _sup(m):
+        body = m.group(1) or m.group(2)
+        return _script_chars(body, _SUP_CHARS) or ('^' + body)
+    def _sub(m):
+        body = m.group(1) or m.group(2)
+        return _script_chars(body, _SUB_CHARS) or ('_' + body)
+    for _ in range(3):
+        s2 = re.sub(r'\^\s*(?:\{([^{}]*)\}|([0-9A-Za-z+\-°]))', _sup, s)
+        s2 = re.sub(r'_\s*(?:\{([^{}]*)\}|([0-9A-Za-z+\-]))', _sub, s2)
+        if s2 == s:
+            break
+        s = s2
+
+    # 8) Lệnh còn lại: bỏ dấu \ giữ tên (\sin → sin, \log → log)
+    s = re.sub(r'\\([A-Za-z]+)', r'\1', s)
+    s = s.replace('\\', '')
+
+    # 9) Dọn ngoặc nhọn thừa + khoảng trắng
+    s = s.replace('{', '').replace('}', '')
+    s = re.sub(r'[ \t]{2,}', ' ', s)
+    return s.strip()
+
+
+def plain_if_latex(text: str) -> str:
+    """Chỉ hạ xuống Unicode khi đoạn text thực sự còn LaTeX — text thường
+    (kể cả có ký hiệu ° ² sẵn) giữ nguyên không đụng tới."""
+    return latex_to_plain(text) if has_latex(text) else (text or '')

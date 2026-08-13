@@ -87,14 +87,20 @@ def check_internet():
     now = _time.time()
     if now - _net_cache['ts'] < 30:
         return _net_cache['ok']
+    # Thử 2 đích khác nhau: một lần chớp nháy mạng (hoặc 8.8.8.8 bị chặn tạm)
+    # từng làm nút Giải toàn đề báo "không có internet" suốt 30s dù mạng vẫn tốt
     ok = False
-    try:
-        with socket.create_connection(('8.8.8.8', 53), timeout=3):
-            ok = True
-    except Exception:
-        ok = False
+    for host in ('8.8.8.8', '1.1.1.1'):
+        try:
+            with socket.create_connection((host, 53), timeout=3):
+                ok = True
+                break
+        except Exception:
+            continue
     _net_cache['ok'] = ok
-    _net_cache['ts'] = now
+    # Chỉ cache lâu khi CÓ mạng; lúc mất mạng cache ngắn (5s) để vừa có lại
+    # là dùng được ngay, thầy không phải chờ
+    _net_cache['ts'] = now if ok else now - 25
     return ok
 
 def copy_to_destinations(filepath: str, settings: dict) -> list:

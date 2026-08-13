@@ -8,6 +8,11 @@ from core.document_model import Document, Question
 
 THEORY_TYPES  = {'trac_nghiem_lua_chon', 'dung_sai', 'ly_thuyet'}
 
+# Hạn mức độ dài trả lời. Model 'thinking' (ag/gemini-3.5-flash-low) tiêu tốn
+# token cho cả phần suy nghĩ, nên mức cũ 8000 khiến đề dài bị cắt giữa chừng →
+# các câu cuối không có [CÂU n] → thầy phải bấm giải lại từng câu.
+MAX_TOKENS = 32000
+
 SYSTEM_PROMPT = """Bạn là giáo viên Vật lý THPT Việt Nam giỏi. Lời giải MẠCH LẠC, TỐI GIẢN.
 KHÔNG thêm bất kỳ text nào ngoài định dạng.
 
@@ -50,12 +55,17 @@ _SECTION_FORMAT_HINT = {
 }
 
 
-def _build_full_prompt(doc: Document) -> tuple[str, dict]:
+def _build_full_prompt(doc: Document, only_ids: set = None) -> tuple[str, dict]:
     """Tạo prompt chứa toàn bộ đề. Trả về (prompt_text, {số_toàn_cục: q_id}).
 
     Đánh số [CÂU n] TOÀN CỤC liên tục qua mọi phần — số câu trong đề thi
     chuẩn reset về 1 ở đầu mỗi phần (Phần I câu 1-18, Phần II câu 1-4...)
-    nên q.number trùng nhau giữa các phần, không dùng làm khóa map được."""
+    nên q.number trùng nhau giữa các phần, không dùng làm khóa map được.
+
+    only_ids: chỉ IN RA các câu này (dùng cho lượt giải bù câu còn thiếu).
+    Bộ đếm gnum VẪN chạy qua toàn bộ câu → câu số 7 ở lượt đầu vẫn là
+    [CÂU 7] ở lượt giải bù, nên lời giải không bao giờ rơi nhầm câu.
+    """
     from core.chuong_trinh import build_scope_prompt, REMINDER
 
     scope_text = build_scope_prompt(getattr(doc, 'ai_scope', None))
@@ -69,14 +79,21 @@ def _build_full_prompt(doc: Document) -> tuple[str, dict]:
     for section in doc.sections:
         if section.is_theory:
             continue
+        sec_head = []
         if section.label:
-            lines.append(f"\n== {section.label} ==")
+            sec_head.append(f"\n== {section.label} ==")
         hint = _SECTION_FORMAT_HINT.get(section.type)
         if hint:
-            lines.append(f"(Định dạng lời giải: {hint})")
+            sec_head.append(f"(Định dạng lời giải: {hint})")
+        head_written = False
         for q in section.questions:
             gnum += 1
             num_to_id[str(gnum)] = q.id
+            if only_ids is not None and q.id not in only_ids:
+                continue          # bỏ qua phần in, KHÔNG bỏ qua bộ đếm
+            if not head_written:
+                lines.extend(sec_head)
+                head_written = True
             lines.append(f"\n[CÂU {gnum}]")
             lines.append(q.text)
             if q.options:
@@ -88,6 +105,34 @@ def _build_full_prompt(doc: Document) -> tuple[str, dict]:
     if scope_text:
         lines.append(REMINDER)
     return "\n".join(lines), num_to_id
+
+
+def _fill_missing(doc: Document, num_to_id: dict, solutions: dict,
+                  call_fn, rounds: int = 2) -> dict:
+    """Giải bù các câu chưa có lời giải (đề dài hay bị cắt giữa chừng vì chạm
+    hạn mức độ dài — model 'thinking' còn tiêu tốn thêm cho phần suy nghĩ).
+
+    call_fn(prompt) -> text. Giữ NGUYÊN số thứ tự câu: prompt giải bù dùng
+    lại đúng con số toàn cục của lượt đầu (xem _build_full_prompt.only_ids).
+    """
+    for _ in range(max(0, rounds)):
+        missing = {qid for qid in num_to_id.values() if qid not in solutions}
+        if not missing:
+            break
+        try:
+            prompt, _ = _build_full_prompt(doc, only_ids=missing)
+            text = call_fn(prompt)
+        except Exception as e:
+            print(f'[AI] Giải bù thất bại: {e}', flush=True)
+            break
+        added = _parse_solutions(text, num_to_id)
+        # chỉ nhận lời giải của đúng những câu đang thiếu
+        added = {k: v for k, v in added.items() if k in missing}
+        if not added:
+            break                 # vòng này không thêm được gì → dừng sớm
+        solutions.update(added)
+        print(f'[AI] Giải bù thêm {len(added)} câu', flush=True)
+    return solutions
 
 
 # Chấp nhận [CÂU 1] / [Câu 1] / [câu 1] / **[CÂU 1]** / [CÂU 1]: — model qua
@@ -123,13 +168,15 @@ def _call_9router(prompt: str, model: str, api_key: str,
             {'role': 'system', 'content': SYSTEM_PROMPT},
             {'role': 'user',   'content': prompt},
         ],
-        'max_tokens': 8000,
+        # Model 'thinking' (ag/...) tiêu tốn hạn mức cho cả phần suy nghĩ —
+        # 8000 làm đề dài bị cắt giữa chừng, các câu sau mất lời giải
+        'max_tokens': MAX_TOKENS,
         'stream': False,
     }
     for attempt in range(4):
         try:
             r = requests.post(f'{base_url}/chat/completions',
-                              json=payload, headers=headers, timeout=120)
+                              json=payload, headers=headers, timeout=300)
             if r.status_code == 200:
                 import json as _j
                 raw = r.text.strip()
@@ -174,7 +221,7 @@ def _stream_9router(prompt: str, model: str, api_key: str,
         f'{base_url}/chat/completions',
         headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
         json={
-            'model': model, 'stream': True, 'max_tokens': 8000,
+            'model': model, 'stream': True, 'max_tokens': MAX_TOKENS,
             'messages': [
                 {'role': 'system', 'content': SYSTEM_PROMPT},
                 {'role': 'user',   'content': prompt},
@@ -276,7 +323,10 @@ def _call_gemini(prompt: str, model: str, api_key: str) -> str:
         try:
             response = genai.GenerativeModel(
                 m, system_instruction=SYSTEM_PROMPT
-            ).generate_content(prompt, request_options={'timeout': 120})
+            ).generate_content(
+                prompt,
+                generation_config={'max_output_tokens': MAX_TOKENS},
+                request_options={'timeout': 300})
             return response.text.strip()
         except Exception as e:
             last_err = e
@@ -457,35 +507,41 @@ def solve_document(doc: Document,
                       for s in doc.sections if not s.is_theory)
     model = model_exercise if has_tu_luan else model_theory
 
-    def _route(m: str) -> str:
+    def _route(m: str, p: str = None) -> str:
+        """p: prompt cần gửi (mặc định prompt của cả đề; lượt giải bù truyền
+        prompt rút gọn chỉ gồm các câu còn thiếu)."""
+        p = prompt if p is None else p
         # 9Router: model dạng provider/model-name (if/kimi-k2, kr/claude-sonnet-4.5...)
         if _is_9router_model(m):
             if niner_key:
-                return _call_9router(prompt, m, niner_key, niner_url)
+                return _call_9router(p, m, niner_key, niner_url)
             raise ValueError(f'Model "{m}" cần 9Router key. Vào Cài đặt → 9Router để nhập key.')
         # Claude direct
         if m.startswith('claude-'):
             if claude_key:
-                return _call_claude(prompt, m, claude_key)
+                return _call_claude(p, m, claude_key)
             # Thử qua 9Router nếu có key
             if niner_key:
-                return _call_9router(prompt, m, niner_key, niner_url)
+                return _call_9router(p, m, niner_key, niner_url)
             raise ValueError(f'Model "{m}" cần Claude API key hoặc 9Router key.')
         # Gemini direct
         if m.startswith('gemini-'):
             if gemini_key:
-                return _call_gemini(prompt, m, gemini_key)
+                return _call_gemini(p, m, gemini_key)
             # Tu dong chuyen sang Gemini CLI qua 9Router
             if niner_key:
                 print(f'[AI] Khong co Gemini key, tu chuyen sang {DEFAULT_9ROUTER_MODEL}', flush=True)
-                return _call_9router(prompt, DEFAULT_9ROUTER_MODEL, niner_key, niner_url)
+                return _call_9router(p, DEFAULT_9ROUTER_MODEL, niner_key, niner_url)
             raise ValueError('Chưa có Gemini API key. Vào Cài đặt → AI để nhập key Gemini hoặc dùng 9Router.')
         # Model không rõ — thử theo thứ tự
         if niner_key:
-            return _call_9router(prompt, m, niner_key, niner_url)
+            return _call_9router(p, m, niner_key, niner_url)
         if gemini_key:
-            return _call_gemini(prompt, m, gemini_key)
+            return _call_gemini(p, m, gemini_key)
         raise ValueError('Chưa cài API key phù hợp. Vào Cài đặt → AI để thêm key.')
+
+    def _route_prompt(p: str) -> str:
+        return _route(model, p)
 
     try:
         text = _route(model)
@@ -493,6 +549,10 @@ def solve_document(doc: Document,
         return {'error': str(e)}
 
     solutions = _parse_solutions(text, num_to_id)
+
+    # Giải bù câu còn thiếu TRƯỚC khi điền placeholder — đề dài bị cắt giữa
+    # chừng là chuyện thường, thầy không phải bấm giải lại từng câu
+    _fill_missing(doc, num_to_id, solutions, _route_prompt)
 
     # Câu CÓ HÌNH/ĐỒ THỊ → giải lại bằng Vision (đè lên đáp án text), 3 bước tư duy
     try:
@@ -552,6 +612,27 @@ def stream_solve_document(doc: Document,
         return
 
     solutions = _parse_solutions(full_text, num_to_id)
+
+    # Giải bù câu còn thiếu (đề dài hay bị cắt giữa chừng) — làm TRƯỚC khi điền
+    # placeholder, để thầy không phải bấm giải lại từng câu
+    def _retry_call(p: str) -> str:
+        if niner_key:
+            m = model_exercise if _is_9router_model(model_exercise) else DEFAULT_9ROUTER_MODEL
+            return _call_9router(p, m, niner_key, niner_url)
+        if claude_key:
+            return _call_claude(p, 'claude-sonnet-4-6', claude_key)
+        if gemini_key:
+            return _call_gemini(p, model_exercise, gemini_key)
+        raise RuntimeError('Không có key để giải bù')
+
+    missing_first = [qid for qid in num_to_id.values() if qid not in solutions]
+    if missing_first:
+        yield {'type': 'chunk',
+               'text': f"\n\n⏳ Đang giải bổ sung {len(missing_first)} câu còn thiếu…\n"}
+        _fill_missing(doc, num_to_id, solutions, _retry_call)
+        done_n = len(missing_first) - len(
+            [q for q in missing_first if q not in solutions])
+        yield {'type': 'chunk', 'text': f"✓ Đã giải bổ sung {done_n} câu.\n"}
 
     # Câu CÓ HÌNH/ĐỒ THỊ → giải lại bằng Vision (3 bước tư duy), đè lên đáp án text
     try:
