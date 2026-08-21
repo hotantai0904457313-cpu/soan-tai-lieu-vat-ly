@@ -845,3 +845,54 @@ def plain_if_latex(text: str) -> str:
     """Chỉ hạ xuống Unicode khi đoạn text thực sự còn LaTeX — text thường
     (kể cả có ký hiệu ° ² sẵn) giữ nguyên không đụng tới."""
     return latex_to_plain(text) if has_latex(text) else (text or '')
+
+
+# ── Bỏ dấu tiếng Việt TRONG công thức (chỉ cho đường xuất Word/AIOMT) ─
+# AIOMT không chuyển được chữ có dấu nằm trong $...$ ("v khí", "m_{đá}").
+# Nặng hơn: quy tắc _is_real_math coi span có dấu tiếng Việt là "câu chữ" nên
+# GỠ LUÔN dấu $ → AIOMT không hề thấy đó là công thức. Bỏ dấu trước khi chuẩn
+# hoá vừa cứu được dấu $, vừa cho AIOMT chuyển trọn công thức.
+# CHỈ đụng phần trong $...$ — văn xuôi ngoài công thức giữ nguyên dấu tiếng Việt.
+
+# Dấu hiệu "đây là công thức thật": có lệnh LaTeX, chỉ số/số mũ, hoặc phép tính
+_MATH_SIGNAL_RE = re.compile(r'\[A-Za-z]+|[_^]|=\s*[-\d.,]|\d\s*[+\-*/]\s*\d')
+
+
+def _deaccent_vn(s: str) -> str:
+    """Bỏ dấu thanh/dấu phụ tiếng Việt: 'khí'→'khi', 'đá'→'da', 'nước'→'nuoc'.
+    CHỈ bỏ dấu phụ Latin (U+0300–U+036F) — giữ nguyên mũi tên vectơ U+20D7
+    và mọi ký hiệu toán khác."""
+    out = unicodedata.normalize('NFD', s)
+    out = ''.join(c for c in out if not ('\u0300' <= c <= '\u036f'))
+    out = unicodedata.normalize('NFC', out)
+    return out.replace('đ', 'd').replace('Đ', 'D')
+
+
+def strip_accents_in_math(text: str, max_vn_words: int = 3) -> str:
+    """Bỏ dấu tiếng Việt trong các span $...$ TRÔNG NHƯ CÔNG THỨC.
+
+    Span là văn xuôi bị bọc nhầm $ (nhiều chữ có dấu, không có ký hiệu toán)
+    thì GIỮ NGUYÊN dấu — để unwrap_pseudo_math gỡ $ như cũ, tránh đẩy cả câu
+    tiếng Việt vào AIOMT và làm mất dấu văn bản.
+    """
+    if not text or '$' not in text:
+        return text
+
+    def _fix(m):
+        whole = m.group(0)
+        inner = m.group(1)
+        if not _VN_DIACRITIC.search(inner):
+            return whole
+        # Đáp án 'A. ... B. ...' / ý 'a) ...' → là text, không đụng
+        if re.search(r'(?:^|\s)(?:[A-D]\.|[a-d]\))\s', inner):
+            return whole
+        if not _MATH_SIGNAL_RE.search(inner):
+            return whole
+        vn_words = sum(1 for w in inner.split() if _VN_DIACRITIC.search(w))
+        if vn_words > max_vn_words:
+            return whole            # cả câu tiếng Việt → để nguyên cho unwrap
+        return whole.replace(inner, _deaccent_vn(inner))
+
+    text = re.sub(r'\$\$(.+?)\$\$', _fix, text, flags=re.DOTALL)
+    text = re.sub(r'\$([^$\n]+?)\$', _fix, text)
+    return text

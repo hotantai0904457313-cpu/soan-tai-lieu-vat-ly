@@ -490,7 +490,8 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
     import shutil
-    from core.latex_normalize import normalize_latex, unicode_to_latex, to_mau_standard
+    from core.latex_normalize import (normalize_latex, unicode_to_latex,
+                                  to_mau_standard, strip_accents_in_math)
 
     if settings is None:
         settings = {}
@@ -590,7 +591,10 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
         shade_fill → mã màu nền (hex) áp cho MỌI paragraph của trường này (lời giải).
         """
         correct_subs = correct_subs or set()
-        text = to_mau_standard(normalize_latex(unicode_to_latex(text or '')))
+        # Bỏ dấu tiếng Việt TRONG công thức: AIOMT không chuyển được chữ có
+        # dấu, và quy tắc unwrap còn gỡ luôn dấu $ của span có dấu tiếng Việt
+        text = to_mau_standard(normalize_latex(
+            strip_accents_in_math(unicode_to_latex(text or ''))))
         if split_answers:
             text = _format_exam_text(text)   # tách đáp án A/B/C/D, Câu/Bài xuống dòng
         if not text.strip() and lead_para is None:
@@ -743,7 +747,8 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
             for opt in q.options:
                 po = docx.add_paragraph()
                 po.paragraph_format.left_indent = Cm(0.8)
-                opt_txt = to_mau_standard(normalize_latex(unicode_to_latex(opt)))
+                opt_txt = to_mau_standard(normalize_latex(
+                    strip_accents_in_math(unicode_to_latex(opt))))
                 if correct_letter and _opt_letter(opt) == correct_letter:
                     write_letter_underline(po, opt_txt, 12)
                 else:
