@@ -26,8 +26,8 @@ DEFAULT_SETTINGS = {
     'claude_api_key': '',
     'niner_router_key': '',
     'niner_router_url': 'http://localhost:20128/v1',
-    'model_theory':  'ag/gemini-3.5-flash-low',
-    'model_exercise': 'ag/gemini-3.5-flash-low',
+    'model_theory':  'ag/gemini-3.7-flash-low',
+    'model_exercise': 'ag/gemini-3.7-flash-low',
 }
 
 ALLOWED_EXTENSIONS = {'pdf', 'docx', 'doc', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'tiff', 'bmp'}

@@ -903,7 +903,7 @@ def _pil_to_jpeg_b64(img: PILImage.Image, max_side: int = 2000, quality: int = 8
 
 def _call_9router_vision_json(page_images: List[PILImage.Image], niner_key: str,
                               niner_url: str = 'http://localhost:20128/v1',
-                              model: str = 'ag/gemini-3.5-flash-low',
+                              model: str = 'ag/gemini-3.7-flash-low',
                               max_retries: int = 3) -> str:
     """Gọi Gemini 3 Flash qua 9Router (OpenAI-compatible) với ảnh base64 → trả raw text JSON.
     Retry/backoff khi gặp 429."""
@@ -952,7 +952,7 @@ def _merge_vision_sections(section_lists: List[list]) -> list:
 
 def import_with_vision_9router(filepath: str, niner_key: str,
                                niner_url: str = 'http://localhost:20128/v1',
-                               model: str = 'ag/gemini-3.5-flash-low',
+                               model: str = 'ag/gemini-3.7-flash-low',
                                gemini_key: str = '') -> Document:
     """Import PDF/DOCX bằng Gemini 3 Flash qua 9Router, render trang → gọi SONG SONG theo cụm.
     Fallback: Gemini API trực tiếp (nếu có key) → import_file."""

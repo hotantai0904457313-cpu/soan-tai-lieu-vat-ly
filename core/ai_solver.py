@@ -8,7 +8,7 @@ from core.document_model import Document, Question
 
 THEORY_TYPES  = {'trac_nghiem_lua_chon', 'dung_sai', 'ly_thuyet'}
 
-# Hạn mức độ dài trả lời. Model 'thinking' (ag/gemini-3.5-flash-low) tiêu tốn
+# Hạn mức độ dài trả lời. Model 'thinking' (ag/gemini-3.7-flash-low) tiêu tốn
 # token cho cả phần suy nghĩ, nên mức cũ 8000 khiến đề dài bị cắt giữa chừng →
 # các câu cuối không có [CÂU n] → thầy phải bấm giải lại từng câu.
 MAX_TOKENS = 32000
@@ -311,7 +311,7 @@ def _stream_claude(prompt: str, model: str, api_key: str,
 
 GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash']
 # Model mac dinh qua 9Router Antigravity (uu tien, da ket noi)
-DEFAULT_9ROUTER_MODEL = 'ag/gemini-3.5-flash-low'
+DEFAULT_9ROUTER_MODEL = 'ag/gemini-3.7-flash-low'
 
 def _call_gemini(prompt: str, model: str, api_key: str) -> str:
     import google.generativeai as genai
@@ -440,7 +440,7 @@ def _vision_solve_one(q: Question, model: str,
             pass
     # 3) Fallback Gemini 3 Flash qua 9Router (Antigravity)
     try:
-        return _vision_clean(_via_router('ag/gemini-3.5-flash-low'), q.number)
+        return _vision_clean(_via_router('ag/gemini-3.7-flash-low'), q.number)
     except Exception:
         return None
 
@@ -493,8 +493,8 @@ def _solve_image_questions(doc: Document, model: str,
 def solve_document(doc: Document,
                    gemini_key: str = '', claude_key: str = '',
                    niner_key: str = '', niner_url: str = 'http://localhost:20128/v1',
-                   model_theory: str = 'ag/gemini-3.5-flash-low',
-                   model_exercise: str = 'ag/gemini-3.5-flash-low') -> dict:
+                   model_theory: str = 'ag/gemini-3.7-flash-low',
+                   model_exercise: str = 'ag/gemini-3.7-flash-low') -> dict:
     """
     Giải toàn bộ đề trong 1 request. Trả về {q_id: solution_text}.
     Thứ tự ưu tiên theo model đã chọn: 9Router > Claude > Gemini.
@@ -571,7 +571,7 @@ def solve_document(doc: Document,
 def stream_solve_document(doc: Document,
                           claude_key: str = '', gemini_key: str = '',
                           niner_key: str = '', niner_url: str = 'http://localhost:20128/v1',
-                          model_exercise: str = 'ag/gemini-3.5-flash-low') -> Generator:
+                          model_exercise: str = 'ag/gemini-3.7-flash-low') -> Generator:
     """
     Generator yield SSE events dạng dict.
     Mỗi event: {'type': 'chunk'|'done'|'error', 'text': ..., 'solutions': ...}

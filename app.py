@@ -498,7 +498,7 @@ def api_ai_solve_stream():
     claude_key = settings.get('claude_api_key',   '')
     niner_key  = settings.get('niner_router_key', '')
     niner_url  = settings.get('niner_router_url', 'http://localhost:20128/v1')
-    model_ex   = settings.get('model_exercise',   'ag/gemini-3.5-flash-low')
+    model_ex   = settings.get('model_exercise',   'ag/gemini-3.7-flash-low')
 
     if not gemini_key and not claude_key and not niner_key:
         return jsonify({'error': 'Chưa cấu hình API key. Vào Cài đặt → AI để nhập.'}), 400
@@ -540,8 +540,8 @@ def api_ai_solve():
     claude_key    = settings.get('claude_api_key',   '')
     niner_key     = settings.get('niner_router_key', '')
     niner_url     = settings.get('niner_router_url', 'http://localhost:20128/v1')
-    model_th      = settings.get('model_theory',     'ag/gemini-3.5-flash-low')
-    model_ex      = settings.get('model_exercise',   'ag/gemini-3.5-flash-low')
+    model_th      = settings.get('model_theory',     'ag/gemini-3.7-flash-low')
+    model_ex      = settings.get('model_exercise',   'ag/gemini-3.7-flash-low')
 
     if not gemini_key and not claude_key and not niner_key:
         return jsonify({'error': 'Chưa cấu hình API key. Vào Cài đặt → AI để nhập.'}), 400
@@ -1257,7 +1257,7 @@ def api_test_ai():
         elif api_type == 'niner':
             import requests as req, re as _re
             base_url = data.get('url', 'http://localhost:20128/v1')
-            model    = data.get('model', 'ag/gemini-3.5-flash-low')
+            model    = data.get('model', 'ag/gemini-3.7-flash-low')
             r = req.post(f'{base_url}/chat/completions',
                 headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
                 json={'model': model,

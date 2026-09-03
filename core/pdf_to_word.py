@@ -373,7 +373,7 @@ def _call_ai_fix(prompt_text: str, gemini_api_key: str,
                   niner_url: str = "", niner_key: str = "") -> str:
     """
     Goi AI de sua cong thuc. Uu tien:
-    1. 9Router Gemini CLI (ag/gemini-3.5-flash-low) neu 9Router dang chay
+    1. 9Router Gemini CLI (ag/gemini-3.7-flash-low) neu 9Router dang chay
     2. Gemini API truc tiep neu co key
     Fail-fast: timeout ngan, KHONG retry; gap rate-limit thi ngat mach (skip).
     Tra ve text da sua, hoac '' neu khong sua duoc.
@@ -395,7 +395,7 @@ def _call_ai_fix(prompt_text: str, gemini_api_key: str,
                     max_retries=0,     # KHONG tu retry (tranh backoff lau khi 429)
                 )
                 resp = client.chat.completions.create(
-                    model="ag/gemini-3.5-flash-low",
+                    model="ag/gemini-3.7-flash-low",
                     messages=[{"role": "user", "content": prompt_text}],
                     temperature=0.1,
                 )
@@ -432,7 +432,7 @@ def _fix_formulas_with_gemini(md_path: Path, api_key: str,
                                niner_url: str = "", niner_key: str = "") -> Path:
     """
     Sua cong thuc trong Markdown sau khi ODL convert.
-    Uu tien: 9Router ag/gemini-3.5-flash-low → Gemini API direct fallback.
+    Uu tien: 9Router ag/gemini-3.7-flash-low → Gemini API direct fallback.
     """
     PROMPT = (
         "Bạn là chuyên gia LaTeX và Vật lý THPT Việt Nam.\n"
@@ -1000,7 +1000,7 @@ def _vision_call(model: str, img_bytes: bytes, prompt: str,
                  gemini_api_key: str = "", max_retries: int = 2) -> str:
     """
     Gửi 1 ảnh trang + prompt cho model Vision, trả về text. Tự lùi (backoff) khi 429.
-      - model có '/' (vd ag/gemini-3.5-flash-low) → gọi 9Router (OpenAI-compatible, ảnh base64).
+      - model có '/' (vd ag/gemini-3.7-flash-low) → gọi 9Router (OpenAI-compatible, ảnh base64).
       - model không '/' (vd gemini-2.5-flash) → gọi Gemini API trực tiếp.
     Fallback: 9Router lỗi + có Gemini key → thử gemini-2.5-flash trực tiếp.
     """
@@ -1060,7 +1060,7 @@ def _vision_call(model: str, img_bytes: bytes, prompt: str,
 
 
 def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
-                     fig_dir: Path, model: str = "ag/gemini-3.5-flash-low",
+                     fig_dir: Path, model: str = "ag/gemini-3.7-flash-low",
                      niner_url: str = "", niner_key: str = "",
                      gemini_api_key: str = "") -> str:
     """Xử lý 1 trang qua Vision (9Router hoặc Gemini trực tiếp) → markdown
@@ -1159,7 +1159,7 @@ def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
 
 
 def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
-                        model: str = "ag/gemini-3.5-flash-low",
+                        model: str = "ag/gemini-3.7-flash-low",
                         page_range: str | None = None,
                         niner_url: str = "", niner_key: str = "",
                         progress_cb=None) -> Path:
@@ -1253,7 +1253,7 @@ def convert_pdf_to_markdown(pdf_path: str, out_md: str | None = None,
                             page_range: str | None = None, progress_cb=None,
                             gemini_api_key: str = "", niner_url: str = "",
                             niner_key: str = "",
-                            model: str = "ag/gemini-3.5-flash-low") -> dict:
+                            model: str = "ag/gemini-3.7-flash-low") -> dict:
     """
     OCR PDF (kể cả bản scan) bằng Gemini Vision → 1 file Markdown SẠCH cho NotebookLM.
     Mỗi trang 1 request Vision (song song), công thức $...$, hình mô tả bằng chữ,
@@ -1451,7 +1451,7 @@ def _odl_text_only(pdf_path: Path, work_dir: Path, page_range: str,
 def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
                         gemini_api_key: str = "", page_range: str | None = None,
                         niner_url: str = "", niner_key: str = "",
-                        gemini_model: str = "ag/gemini-3.5-flash-low",
+                        gemini_model: str = "ag/gemini-3.7-flash-low",
                         progress_cb=None) -> Path:
     """
     LAI theo trang: ODL cho trang chữ (gom cụm liên tiếp → ít lần gọi), Gemini
