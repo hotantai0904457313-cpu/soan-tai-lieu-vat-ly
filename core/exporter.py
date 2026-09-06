@@ -109,6 +109,60 @@ IMG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'uplo
 
 # ── PDF ───────────────────────────────────────────────────────────
 
+_RASTER_EXT = {'.png', '.jpg', '.jpeg', '.gif', '.bmp'}
+
+
+def _raster_path(path: str, tmp_dir: str) -> Optional[str]:
+    """Đường dẫn ảnh dùng được cho python-docx / reportlab. File .wmf/.emf (212 file
+    cũ trong uploads, và cả file .png nhưng ruột là WMF do bản cũ ghi thô) → chuyển
+    PNG tạm qua PIL; không mở được → None (bỏ ảnh, không ném — trước đây add_picture
+    ném rồi bị nuốt lặng, hình "mất luôn")."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        from PIL import Image as PILImage
+    except Exception:
+        return path
+    try:
+        with PILImage.open(path) as im:
+            if im.format in ('PNG', 'JPEG', 'GIF', 'BMP') and \
+                    os.path.splitext(path)[1].lower() in _RASTER_EXT:
+                return path
+    except Exception:
+        return None
+    try:
+        im = PILImage.open(path)
+        try:
+            im.load(dpi=300)
+        except TypeError:
+            im.load()
+        if im.mode in ('RGBA', 'LA') or (im.mode == 'P' and 'transparency' in im.info):
+            im = im.convert('RGBA')
+            bg = PILImage.new('RGB', im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        elif im.mode != 'RGB':
+            im = im.convert('RGB')
+        out = os.path.join(tmp_dir, uuid.uuid4().hex[:8] + '.png')
+        im.save(out, 'PNG')
+        return out
+    except Exception:
+        return None
+
+
+def _split_opts(q):
+    """(đề, phương án) — cứu khối A./B./C./D. bị nuốt vào đề (tài liệu nhập trước khi
+    vá), bản cục bộ, KHÔNG ghi đè tài liệu đã lưu."""
+    from core.importer import split_options_from_text
+    return split_options_from_text(q.text, q.options)
+
+
+def _opt_images_for(q, n_opts):
+    """Danh sách hình theo phương án, độ dài đúng n_opts (thiếu → [])."""
+    oi = [list(x or []) for x in (getattr(q, 'option_images', None) or [])]
+    return (oi + [[] for _ in range(n_opts)])[:n_opts]
+
+
 def export_pdf(doc: Document, output_path: str, show_solutions: bool = True, settings: dict = None):
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import cm, mm
@@ -246,13 +300,14 @@ def export_pdf(doc: Document, output_path: str, show_solutions: bool = True, set
                 # Câu hỏi — LUÔN qua _math_paragraph: LaTeX có thể xuất hiện cả
                 # khi không có dấu $ (AI/file gốc viết \frac, \sqrt trần)
                 q_prefix = f'<b>Câu {q.number}.</b> '
-                q_block.extend(_math_paragraph(q.text, style_q_math, tmp_dir,
+                q_text, q_options = _split_opts(q)
+                q_block.extend(_math_paragraph(q_text, style_q_math, tmp_dir,
                                                fontsize=12, prefix=q_prefix))
 
-                # Hình ảnh câu hỏi
+                # Hình ảnh câu hỏi (ảnh .wmf cũ → PNG tạm; không đọc được → bỏ)
                 for img in q.images:
-                    img_path = os.path.join(IMG_DIR, img.filename)
-                    if os.path.exists(img_path):
+                    img_path = _raster_path(os.path.join(IMG_DIR, img.filename), tmp_dir)
+                    if img_path:
                         try:
                             ri = RLImage(img_path, kind='proportional',
                                          width=min(10*cm, CONTENT_W * 0.7),
@@ -263,17 +318,33 @@ def export_pdf(doc: Document, output_path: str, show_solutions: bool = True, set
                         except Exception:
                             pass
 
-                # Options A/B/C/D — bố cục 2 cột (đáp án cũng có thể chứa công thức)
+                # Options A/B/C/D — bố cục 2 cột (đáp án cũng có thể chứa công thức);
+                # hình theo phương án (4 đồ thị) đặt ngay dưới chữ A/B/C/D trong ô
                 def _opt_para(s):
                     return _math_paragraph(s, style_opt, tmp_dir, fontsize=12)[0]
 
-                if q.options:
-                    opts = q.options
+                opt_imgs = _opt_images_for(q, len(q_options))
+
+                def _opt_cell(i, max_w):
+                    parts = [_opt_para(q_options[i])]
+                    for img in opt_imgs[i]:
+                        p_img = _raster_path(os.path.join(IMG_DIR, img.filename), tmp_dir)
+                        if not p_img:
+                            continue
+                        try:
+                            parts.append(RLImage(p_img, kind='proportional',
+                                                 width=max_w, height=6*cm))
+                        except Exception:
+                            pass
+                    return parts if len(parts) > 1 else parts[0]
+
+                if q_options:
+                    opts = q_options
                     if len(opts) == 4:
                         col_w = CONTENT_W / 2
                         tdata = [
-                            [_opt_para(opts[0]), _opt_para(opts[1])],
-                            [_opt_para(opts[2]), _opt_para(opts[3])],
+                            [_opt_cell(0, col_w * 0.92), _opt_cell(1, col_w * 0.92)],
+                            [_opt_cell(2, col_w * 0.92), _opt_cell(3, col_w * 0.92)],
                         ]
                         t = Table(tdata, colWidths=[col_w, col_w])
                         t.setStyle(TableStyle([
@@ -283,8 +354,9 @@ def export_pdf(doc: Document, output_path: str, show_solutions: bool = True, set
                         ]))
                         q_block.append(t)
                     else:
-                        for opt in opts:
-                            q_block.append(_opt_para(opt))
+                        for i, opt in enumerate(opts):
+                            cell = _opt_cell(i, min(7.5*cm, CONTENT_W * 0.6))
+                            q_block.extend(cell if isinstance(cell, list) else [cell])
 
                 # Sub-items (đúng-sai a/b/c/d)
                 for sub in q.sub_items:
@@ -733,6 +805,7 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
             # Phương án bị nuốt vào đề (tài liệu nhập trước khi vá) → tách ra
             # khi xuất, bản cục bộ, không đụng tài liệu đã lưu
             q_text, q_options = split_options_from_text(q.text, q.options)
+            opt_imgs = _opt_images_for(q, len(q_options))
 
             p = docx.add_paragraph()
             p.paragraph_format.space_before = Pt(6)   # tách câu, nội dung trong câu sát nhau
@@ -742,27 +815,47 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
             emit_field(q_text, size=12, lead_para=p,
                        correct_letter=correct_letter, correct_subs=correct_subs)
 
-            # Hình ảnh
-            for img in q.images:
-                img_path = os.path.join(IMG_DIR, img.filename)
-                if os.path.exists(img_path):
-                    try:
-                        pi = docx.add_paragraph()
-                        run_img = pi.add_run()
-                        run_img.add_picture(img_path, width=Cm(8))
-                    except Exception:
-                        pass
+            # Hình ảnh của câu (.wmf cũ → PNG tạm; không đọc được → bỏ, không ném)
+            def add_picture_para(container, img, width_cm, indent_cm=None):
+                p_img = _raster_path(os.path.join(IMG_DIR, img.filename), tmp_dir)
+                if not p_img:
+                    return
+                try:
+                    para = container.add_paragraph()
+                    if indent_cm:
+                        para.paragraph_format.left_indent = Cm(indent_cm)
+                    para.add_run().add_picture(p_img, width=Cm(width_cm))
+                except Exception:
+                    pass
 
-            # Options — chỉ gạch chân CHỮ CÁI ĐẦU của phương án ĐÚNG (bản đáp án)
-            for opt in q_options:
-                po = docx.add_paragraph()
-                po.paragraph_format.left_indent = Cm(0.8)
+            for img in q.images:
+                add_picture_para(docx, img, 8)
+
+            # Options — chỉ gạch chân CHỮ CÁI ĐẦU của phương án ĐÚNG (bản đáp án).
+            # Đủ 4 phương án đều có hình (4 đồ thị) → LƯỚI 2×2: mỗi ô chữ A/B/C/D + hình;
+            # còn lại → hình đặt ngay sau dòng phương án
+            def _emit_opt(para, opt):
                 opt_txt = to_mau_standard(normalize_latex(
                     strip_accents_in_math(unicode_to_latex(opt))))
                 if correct_letter and _opt_letter(opt) == correct_letter:
-                    write_letter_underline(po, opt_txt, 12)
+                    write_letter_underline(para, opt_txt, 12)
                 else:
-                    write_math_text(po, opt_txt, 12)
+                    write_math_text(para, opt_txt, 12)
+
+            if len(q_options) == 4 and all(opt_imgs[i] for i in range(4)):
+                tbl = docx.add_table(rows=2, cols=2)
+                for i, opt in enumerate(q_options):
+                    cell = tbl.cell(i // 2, i % 2)
+                    _emit_opt(cell.paragraphs[0], opt)
+                    for img in opt_imgs[i]:
+                        add_picture_para(cell, img, 7)
+            else:
+                for i, opt in enumerate(q_options):
+                    po = docx.add_paragraph()
+                    po.paragraph_format.left_indent = Cm(0.8)
+                    _emit_opt(po, opt)
+                    for img in opt_imgs[i]:
+                        add_picture_para(docx, img, 6, indent_cm=0.8)
 
             # Sub-items (Đúng-Sai) — gạch chân ý ĐÚNG ở bản đáp án
             for sub in q.sub_items:

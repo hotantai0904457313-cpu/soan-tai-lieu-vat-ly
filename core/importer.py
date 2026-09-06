@@ -12,6 +12,7 @@ import io
 from core.document_model import Document, Section, Question, Image
 
 IMG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'uploads', 'images')
+PDF_MIN_IMG_PX = 30    # ảnh nhúng PDF nhỏ hơn ngưỡng này (px) coi là rác (icon, bullet)
 os.makedirs(IMG_DIR, exist_ok=True)
 
 # ── Nhận diện cấu trúc (dùng cho import thông thường) ────────────
@@ -50,13 +51,13 @@ QUESTION_PATTERN = re.compile(
 # Dòng không khớp sẽ bị NỐI VÀO ĐỀ → phương án "nhảy lên đề" — nên phải rộng.
 _OPT_MARK = r'\*{0,2}\(?([A-D])\*{0,2}(?:\)|\s*\\?[.):\-])\*{0,2}'
 OPTION_PATTERN = re.compile(
-    r'^' + _OPT_MARK + r'\s*(.+)', re.UNICODE | re.DOTALL)
+    r'^' + _OPT_MARK + r'\s*(.*)', re.UNICODE | re.DOTALL)   # (.*): "A." trần + hình
 
 SUB_ITEM_PATTERN = re.compile(
     r'^([a-d])\s*\\?[.)]\s*(.+)', re.UNICODE | re.DOTALL)  # \\? handles Pandoc \)
 
 MULTI_OPTION_PATTERN = re.compile(
-    _OPT_MARK + r'\s*((?:(?!\*{0,2}\(?[A-D]\*{0,2}(?:\)|\s*\\?[.):\-])).)+)',
+    _OPT_MARK + r'\s*((?:(?!\*{0,2}\(?[A-D]\*{0,2}(?:\)|\s*\\?[.):\-])).)*)',
     re.UNICODE)
 
 
@@ -131,6 +132,121 @@ def sharpen_image(img_bytes: bytes, filename: str) -> str:
     return filename
 
 
+def save_image_bytes(img_bytes: bytes, stem: str) -> Optional[str]:
+    """Lưu ảnh (mọi định dạng PIL mở được — kể cả WMF/EMF trên Windows) thành PNG
+    '<stem>.png' trong IMG_DIR, nền trong suốt → trắng. Trả tên file, hoặc None nếu
+    không giải mã được. KHÔNG ghi file giữ đuôi gốc: trình duyệt không hiện .wmf và
+    python-docx add_picture(.wmf) ném lỗi → hình "mất luôn" khi xuất."""
+    fname = re.sub(r'[^A-Za-z0-9_.-]', '_', stem) + '.png'
+    out_path = os.path.join(IMG_DIR, fname)
+    try:
+        img = PILImage.open(io.BytesIO(img_bytes))
+        try:
+            img.load(dpi=300)          # WMF/EMF: render nét (mặc định 72 dpi rất mờ)
+        except TypeError:
+            img.load()
+        if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+            img = img.convert('RGBA')
+            bg = PILImage.new('RGB', img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        img.save(out_path, 'PNG')
+        return fname
+    except Exception as e:
+        print(f'[save_image_bytes] bỏ ảnh {stem}: {e}', flush=True)
+        return None
+
+
+def _clean_option_text(t: str) -> str:
+    """Phần chữ của phương án chỉ còn dấu câu (hình đã tách ra) → rỗng."""
+    t = (t or '').strip()
+    return '' if re.fullmatch(r'[\s.:;,\-–_]*', t) else t
+
+
+# Placeholder hình trong markdown (đường Pandoc): ![...](media/image1.wmf){...} → {{IMG_n}}
+# để Gemini/regex parser GIỮ hình đúng vị trí (trước đây prompt bảo "bỏ qua ![...]"
+# → hình của phương án mất, hình dư bị dồn vào câu cuối).
+_MD_IMG_RE = re.compile(r'!\[[^\]\n]*\]\(([^)\n]+?)(?:\s+"[^"]*")?\)(\{[^}\n]*\})?')
+_IMG_PH_RE = re.compile(r'\{\{IMG_(\d+)\}\}')
+
+
+def _inject_img_placeholders(md: str, name_map: dict) -> Tuple[str, dict]:
+    """Trả (md đã thay ảnh bằng {{IMG_n}}, {n: tên file đã lưu})."""
+    ph_map: dict = {}
+
+    def _rep(m):
+        base = os.path.basename(m.group(1).replace('\\', '/'))
+        saved = name_map.get(base) or name_map.get(os.path.splitext(base)[0])
+        if not saved:
+            return ' '
+        n = len(ph_map) + 1
+        ph_map[n] = saved
+        return ' {{IMG_%d}} ' % n
+    return _MD_IMG_RE.sub(_rep, md), ph_map
+
+
+def _resolve_img_placeholders(q: Question, ph_map: dict) -> set:
+    """Thay {{IMG_n}} trong text / options / sub_items bằng Image thật:
+    trong phương án → option_images[i]; chỗ khác → q.images. Trả tập filename đã gắn."""
+    used: set = set()
+
+    def _take(s, sink):
+        def _r(m):
+            fn = ph_map.get(int(m.group(1)))
+            if fn:
+                sink.append(Image(filename=fn))
+                used.add(fn)
+            return ' '
+        return _IMG_PH_RE.sub(_r, s or '')
+
+    imgs: List[Image] = []
+    q.text = re.sub(r'[ \t]{2,}', ' ', _take(q.text, imgs)).strip()
+    q.ensure_option_images()
+    for i, opt in enumerate(q.options):
+        oi: List[Image] = []
+        opt = _take(opt, oi)
+        mo = OPTION_PATTERN.match(opt)
+        if mo:
+            opt = (f'{mo.group(1).upper()}. {_clean_option_text(mo.group(2))}').rstrip()
+        q.options[i] = re.sub(r'[ \t]{2,}', ' ', opt).strip()
+        q.option_images[i].extend(oi)
+    for i, sub in enumerate(q.sub_items):
+        q.sub_items[i] = re.sub(r'[ \t]{2,}', ' ', _take(sub, imgs)).strip()
+    q.images.extend(imgs)
+    return used
+
+
+def _collect_fallback_images(fallback_doc: Document):
+    """Ảnh từ bản import thường (nguồn pixel cho Vision). Khoá chính (loại phần, số câu)
+    — số câu reset mỗi PHẦN nên khoá theo số trần bị ghi đè/nhân đôi (chỉ giữ khi duy nhất).
+    Giá trị: (images, option_images) để giữ hình theo phương án."""
+    img_by_qnum: dict = {}
+    img_by_order: List = []
+    img_by_key: dict = {}
+    for sec in fallback_doc.sections:
+        for qi, q in enumerate(sec.questions):
+            if not q.has_images():
+                continue
+            val = (list(q.images), [list(x) for x in (q.option_images or [])])
+            img_by_key[(sec.type, q.number)] = val
+            img_by_qnum[q.number] = None if q.number in img_by_qnum else val
+            img_by_order.append((sec.type, qi, val))
+    return img_by_qnum, img_by_order, img_by_key
+
+
+def _apply_fallback_images(q: Question, val) -> None:
+    """val = (images, option_images) hoặc list Image (dạng cũ)."""
+    if isinstance(val, tuple):
+        images, opt_imgs = val
+    else:
+        images, opt_imgs = list(val or []), []
+    q.images = list(images)
+    if opt_imgs and len(opt_imgs) == len(q.options) and any(opt_imgs):
+        q.option_images = [list(x) for x in opt_imgs]
+
+
 def _parse_pages_1indexed(page_range: str, total: int) -> List[int]:
     """Parse '1-3', '1,3,5', '2', '1-3,5' (đếm từ 1) → list index 0-indexed hợp lệ."""
     pages = set()
@@ -177,46 +293,79 @@ def subset_pdf(src_path: str, dst_path: str, page_range: str) -> bool:
 # ── Import Word (.docx) ───────────────────────────────────────────
 
 def import_docx(filepath: str) -> Document:
+    """Import DOCX bằng python-docx qua core.docx_walk — duyệt ĐÚNG THỨ TỰ tài liệu,
+    lấy ảnh inline/anchor/VML (WMF của MathType)/textbox/nhóm và cả ảnh TRONG Ô BẢNG;
+    bảng 2×2 mà mỗi ô là "A." + hình → phương án kèm hình của phương án đó.
+    (Bản cũ chỉ duyệt doc.paragraphs + a:blip → file toàn VML ra 0 hình, bảng bị bỏ.)"""
     from docx import Document as DocxDoc
-    import zipfile
+    from core.docx_walk import walk_docx, table_option_cells
 
     docx_obj = DocxDoc(filepath)
     doc = Document()
     doc.title = os.path.splitext(os.path.basename(filepath))[0]
 
-    image_map: dict = {}
-    try:
-        with zipfile.ZipFile(filepath) as z:
-            rels_path = 'word/_rels/document.xml.rels'
-            if rels_path in z.namelist():
-                import xml.etree.ElementTree as ET
-                root = ET.fromstring(z.read(rels_path))
-                ns = {'r': 'http://schemas.openxmlformats.org/package/2006/relationships'}
-                for rel in root.findall('r:Relationship', ns):
-                    if 'image' in rel.get('Type', '').lower():
-                        rid = rel.get('Id')
-                        target = rel.get('Target', '')
-                        img_path = 'word/' + target.lstrip('/')
-                        if img_path in z.namelist():
-                            img_bytes = z.read(img_path)
-                            fname = f'{uuid.uuid4().hex[:8]}.png'
-                            saved = sharpen_image(img_bytes, fname)
-                            image_map[rid] = saved
-    except Exception:
-        pass
+    saved_by_rid: dict = {}
 
-    R_EMBED = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed'
-    items: List[Tuple[str, List[str]]] = []
-    for para in docx_obj.paragraphs:
-        text = para.text.strip()
-        img_refs: List[str] = []
-        for elem in para._p.iter():
-            if elem.tag.endswith('}blip'):
-                rid = elem.get(R_EMBED)
-                if rid and rid in image_map:
-                    img_refs.append(image_map[rid])
-        if text or img_refs:
-            items.append((text, img_refs))
+    def _save(img) -> Optional[str]:
+        rid = img.get('rid') or ''
+        if rid in saved_by_rid:
+            return saved_by_rid[rid]          # cùng rId (ảnh dùng lặp) → dùng lại file
+        blob = img.get('blob')
+        fn = save_image_bytes(blob, f'{uuid.uuid4().hex[:8]}_{rid or "img"}') if blob else None
+        saved_by_rid[rid] = fn
+        return fn
+
+    def _files(imgs) -> List[str]:
+        return [f for f in (_save(im) for im in (imgs or [])) if f]
+
+    _DS_MARK = re.compile(r'^\s*(Đ|S|Đúng|Sai|Đ/S)\s*$', re.IGNORECASE)
+    counters: dict = {}   # (numId, ilvl) → số thứ tự đang đếm của danh sách tự động
+    items: list = []
+    for it in walk_docx(docx_obj):
+        if it['kind'] == 'p':
+            text = (it['text'] or '').strip()
+            imgs = _files(it['images'])
+            num = it.get('num')
+            # Đánh số tự động của Word: chữ số/chữ cái không nằm trong text → tự thêm
+            # "N. " (câu) hoặc "A. " (phương án đánh chữ) để các regex phía sau nhận ra
+            if num and text and num[2] != 'bullet' and not QUESTION_PATTERN.match(text) \
+                    and not OPTION_PATTERN.match(text) and not SUB_ITEM_PATTERN.match(text) \
+                    and not detect_section_type(text):
+                key = (num[0], num[1])
+                counters[key] = counters.get(key, 0) + 1
+                k = counters[key]
+                if num[2] in ('upperLetter', 'lowerLetter') and k <= 4:
+                    text = f'{chr(64 + k)}. {text}'
+                elif num[2] not in ('upperLetter', 'lowerLetter', 'upperRoman', 'lowerRoman'):
+                    text = f'{k}. {text}'
+            if text or imgs:
+                items.append((text, imgs))
+            continue
+        kind = it.get('table')
+        if kind == 'option':
+            cells = table_option_cells(it)
+            items.append(('', [], {
+                'option_letters': [L for L, _, _ in cells],
+                'option_texts': [t for _, t, _ in cells],
+                'option_images': [_files(ims) for _, _, ims in cells],
+            }))
+        elif kind == 'data':
+            # Bảng số liệu → bảng Markdown trong text (exporter render thành ảnh)
+            rows = ['| ' + ' | '.join((c['text'] or '').replace('\n', ' ').strip()
+                                     for c in row) + ' |' for row in it['cells']]
+            if len(rows) >= 2:
+                rows.insert(1, '|' + '---|' * it['n_cols'])
+            items.append(('\n'.join(rows), []))
+        else:
+            # Đúng-Sai (bỏ ô Đ/S trống) hoặc bảng thường: từng ô là một dòng
+            for row in it['cells']:
+                for c in row:
+                    text = (c['text'] or '').strip()
+                    imgs = _files(c['images'])
+                    if kind == 'ds' and _DS_MARK.match(text) and not imgs:
+                        continue
+                    if text or imgs:
+                        items.append((text, imgs))
 
     _build_sections_from_items(doc, items)
     return doc
@@ -283,7 +432,8 @@ def _extract_table_images(page, page_num: int):
             if clip.width < 40 or clip.height < 15:
                 continue
             pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), clip=clip)
-            fname = sharpen_image(pix.tobytes('png'), f'p{page_num}_tbl{ti}.png')
+            fname = sharpen_image(pix.tobytes('png'),
+                                  f'{uuid.uuid4().hex[:8]}_p{page_num}_tbl{ti}.png')
             table_imgs.append({'y0': bbox.y0, 'fname': fname})
             table_rects.append(bbox)
         except Exception:
@@ -384,6 +534,7 @@ def import_pdf(filepath: str) -> Document:
                     items.append(('', [tinfo['fname']]))
 
             img_list_raw = page.get_images(full=True)
+            img_x: dict = {}       # x0 của từng ảnh → 4 hình cùng dòng sắp A→D trái sang phải
             for img_index, img_info in enumerate(img_list_raw):
                 xref = img_info[0]
                 try:
@@ -391,15 +542,18 @@ def import_pdf(filepath: str) -> Document:
                     img_bytes = base_img['image']
                     w = base_img.get('width', 0)
                     h = base_img.get('height', 0)
-                    if w < 50 or h < 50:
+                    if w < PDF_MIN_IMG_PX or h < PDF_MIN_IMG_PX:
                         continue
-                    fname = f'p{page_num}_{img_index}.png'
+                    # uuid tiền tố: tên 'p0_0.png' từng TRÙNG giữa các lần nhập → tài liệu
+                    # cũ hiện hình của đề khác
+                    fname = f'{uuid.uuid4().hex[:8]}_p{page_num}_{img_index}.png'
                     saved = sharpen_image(img_bytes, fname)
                     img_y = page_h * (img_index + 1) / (len(img_list_raw) + 1)
                     try:
                         rects = page.get_image_rects(xref)
                         if rects:
                             img_y = (rects[0].y0 + rects[0].y1) / 2
+                            img_x[saved] = rects[0].x0
                     except Exception:
                         pass
                     best_block = None
@@ -419,7 +573,27 @@ def import_pdf(filepath: str) -> Document:
                 except Exception:
                     pass
 
+            # === Đồ thị VECTOR (không phải ảnh nhúng) — gắn tại đây khi có core.pdf_figures ===
+            try:
+                from core.pdf_figures import extract_vector_figures, figure_anchor_line
+                line_rects = [(tb['x'], tb['y'] - 5, tb['x1'], tb['y'] + 5) for tb in text_blocks]
+                for fig in extract_vector_figures(page, table_rects=table_rects,
+                                                  text_lines=line_rects):
+                    fname = f'{uuid.uuid4().hex[:8]}_p{page_num}_vec{len(img_x)}.png'
+                    saved = sharpen_image(fig['png'], fname)
+                    img_x[saved] = fig['rect'].x0
+                    idx = figure_anchor_line(fig['rect'], text_blocks)
+                    if idx is not None:
+                        text_blocks[idx]['imgs'].append(saved)
+                    else:
+                        items.append(('', [saved]))
+            except ImportError:
+                pass
+            except Exception as e:
+                print(f'[pdf_figures] trang {page_num}: {e}', flush=True)
+
             for tb in text_blocks:
+                tb['imgs'].sort(key=lambda f: img_x.get(f, -1))
                 items.append((tb['text'], tb['imgs']))
     except Exception:
         # Lỗi giữa chừng → thử fallback pdfplumber, bỏ items dở của fitz
@@ -448,16 +622,24 @@ def import_pdf(filepath: str) -> Document:
 
 # ── Xây dựng sections từ danh sách items (dùng cho import thông thường) ──
 
-def _build_sections_from_items(doc: Document, items: List[Tuple[str, List[str]]]):
+def _build_sections_from_items(doc: Document, items):
+    """items: [(text, [img_filename...])] hoặc [(text, imgs, meta)].
+    meta = {'option_texts': [...], 'option_images': [[...], ...]} cho BẢNG PHƯƠNG ÁN
+    (lưới 2×2 trong Word) — mỗi ô một phương án + hình của ô đó.
+    Hình ở dòng phương án → option_images (câu "4 phương án là 4 đồ thị"); hình chưa
+    có câu đích (đứng trước "Câu 1", dòng dẫn) → chờ gắn vào câu kế tiếp, không bỏ."""
     current_section: Optional[Section] = None
     current_question: Optional[Question] = None
     q_number = 1
+    pending_imgs: List[str] = []
 
     def flush_question():
         nonlocal current_question
         if current_question and current_section and (
-                current_question.text or current_question.options or current_question.images):
+                current_question.text or current_question.options
+                or current_question.has_images()):
             rescue_options_from_text(current_question)
+            current_question.ensure_option_images()
             current_section.questions.append(current_question)
             current_question = None
 
@@ -469,19 +651,40 @@ def _build_sections_from_items(doc: Document, items: List[Tuple[str, List[str]]]
         current_section = None
         q_number = 1
 
-    def attach_images(img_filenames, target, fallback_section):
-        for fname in img_filenames:
-            img_obj = Image(filename=fname)
-            if target:
-                target.images.append(img_obj)
+    def attach_images(img_filenames, target):
+        for fname in img_filenames or []:
+            if target is not None:
+                target.images.append(Image(filename=fname))
+            else:
+                pending_imgs.append(fname)
 
-    for raw_text, img_list in items:
-        line = raw_text.strip()
+    def add_options(q, texts, img_lists=None):
+        q.ensure_option_images()
+        for i, t in enumerate(texts):
+            q.options.append(t)
+            files = (img_lists[i] if img_lists and i < len(img_lists) else []) or []
+            q.option_images.append([Image(filename=f) for f in files])
 
-        if not line and img_list:
-            attach_images(img_list, current_question, current_section)
+    for item in items:
+        raw_text, img_list = item[0], list(item[1] or [])
+        meta = item[2] if len(item) > 2 and item[2] else {}
+        line = (raw_text or '').strip()
+
+        # Bảng phương án (ô = "A." + hình) thuộc câu hiện tại
+        if meta.get('option_texts'):
+            if current_section is None:
+                current_section = Section(type='khac', label='')
+            if current_question is None:
+                current_question = Question(number=q_number, text='')
+            letters = meta.get('option_letters') or 'ABCD'
+            texts = [f'{L}. {_clean_option_text(t)}'.rstrip()
+                     for L, t in zip(letters, meta['option_texts'])]
+            add_options(current_question, texts, meta.get('option_images'))
             continue
 
+        if not line and img_list:
+            attach_images(img_list, current_question)
+            continue
         if not line:
             continue
 
@@ -491,6 +694,7 @@ def _build_sections_from_items(doc: Document, items: List[Tuple[str, List[str]]]
             current_section = Section(type=stype, label=line,
                                       is_theory=(stype == 'ly_thuyet'))
             q_number = 1
+            pending_imgs.extend(img_list)
             continue
 
         if current_section is None:
@@ -501,59 +705,58 @@ def _build_sections_from_items(doc: Document, items: List[Tuple[str, List[str]]]
             flush_question()
             q_number = int(m_q.group(1))
             current_question = Question(number=q_number, text=m_q.group(2).strip())
-            if img_list:
-                attach_images(img_list, current_question, current_section)
+            if pending_imgs:              # hình đứng TRƯỚC dòng "Câu N" thuộc câu này
+                attach_images(list(pending_imgs), current_question)
+                pending_imgs.clear()
+            attach_images(img_list, current_question)
             continue
 
         if current_question:
             m_opt = OPTION_PATTERN.match(line)
-            if m_opt:
-                parts = split_multi_options(line)
-                if len(parts) > 1:
-                    for part in parts:
-                        mo = OPTION_PATTERN.match(part)
-                        if mo:
-                            current_question.options.append(
-                                f'{mo.group(1).upper()}. {mo.group(2).strip()}')
-                else:
-                    current_question.options.append(
-                        f'{m_opt.group(1).upper()}. {m_opt.group(2).strip()}')
-                if img_list:
-                    attach_images(img_list, current_question, current_section)
-                continue
-
             multi = split_multi_options(line)
-            if len(multi) >= 2 and all(OPTION_PATTERN.match(p) for p in multi):
-                for part in multi:
+            if m_opt or (len(multi) >= 2 and all(OPTION_PATTERN.match(p) for p in multi)):
+                parts = multi if len(multi) >= 2 else [line]
+                texts = []
+                for part in parts:
                     mo = OPTION_PATTERN.match(part)
                     if mo:
-                        current_question.options.append(
-                            f'{mo.group(1).upper()}. {mo.group(2).strip()}')
-                if img_list:
-                    attach_images(img_list, current_question, current_section)
+                        texts.append(
+                            f'{mo.group(1).upper()}. {_clean_option_text(mo.group(2))}'.rstrip())
+                if img_list and len(img_list) == len(texts):
+                    # "A. .B. .C. .D. ." + 4 hình trong cùng đoạn → mỗi phương án 1 hình
+                    add_options(current_question, texts, [[f] for f in img_list])
+                elif img_list and len(texts) == 1:
+                    add_options(current_question, texts, [img_list])
+                else:
+                    add_options(current_question, texts)
+                    attach_images(img_list, current_question)
                 continue
 
             m_sub = SUB_ITEM_PATTERN.match(line)
             if m_sub and current_section.type in ('dung_sai', 'khac'):
                 current_question.sub_items.append(
                     f'{m_sub.group(1)}. {m_sub.group(2).strip()}')
-                if img_list:
-                    attach_images(img_list, current_question, current_section)
+                attach_images(img_list, current_question)
                 continue
 
-            current_question.text += ' ' + line
-            if img_list:
-                attach_images(img_list, current_question, current_section)
+            # Hàng bảng Markdown nối bằng \n để giữ cấu trúc bảng
+            sep = '\n' if (line.startswith('|') or current_question.text.rstrip().endswith('|')) else ' '
+            current_question.text += sep + line
+            attach_images(img_list, current_question)
         else:
             current_section.intro += (' ' + line if current_section.intro else line)
-            if img_list:
-                attach_images(img_list, None, current_section)
+            pending_imgs.extend(img_list)
 
     flush_section()
+    if pending_imgs:                      # hết tài liệu mà còn hình → câu cuối
+        last_q = next((sc.questions[-1] for sc in reversed(doc.sections) if sc.questions), None)
+        if last_q:
+            attach_images(list(pending_imgs), last_q)
+        pending_imgs.clear()
 
     if not doc.sections:
         sec = Section(type='khac', label='Nội dung')
-        sec.intro = '\n'.join(t for t, _ in items[:50])
+        sec.intro = '\n'.join((t[0] or '') for t in items[:50])
         doc.sections.append(sec)
 
     _infer_doc_type(doc)
@@ -593,6 +796,8 @@ VISION_JSON_PROMPT = (
     'Phương án A/B/C/D PHẢI nằm trong "options", TUYỆT ĐỐI không để trong "text".\n'
     "Bảng/lưới 2×2 mà mọi ô bắt đầu bằng A./B./C./D. là BẢNG PHƯƠNG ÁN (không phải bảng số liệu)\n"
     '→ tách từng ô thành 1 phần tử của "options".\n'
+    'Nếu 4 phương án là 4 HÌNH/ĐỒ THỊ (ô chỉ có chữ cái và hình): "options": ["A.","B.","C.","D."]\n'
+    'và thêm "options_are_figures": true vào câu đó.\n'
     '"sub_items": chỉ có khi câu hỏi có mục a/b/c/d (phần đúng-sai) — điền đủ.\n\n'
     "QUY TẮC BẢNG SỐ LIỆU (KHÔNG ĐƯỢC BỎ BẢNG — mất bảng là mất dữ kiện đề):\n"
     "Câu hỏi có BẢNG (bảng số liệu thí nghiệm, bảng giá trị đo, bảng dữ kiện cho đề):\n"
@@ -821,11 +1026,15 @@ _TBL_IMG_RE = re.compile(r'_tbl\d+\.png$')
 
 
 def _json_to_document(data: dict, title: str,
-                      img_by_qnum: dict, img_by_order: List) -> Document:
-    """Chuyển JSON dict từ Gemini thành Document model."""
+                      img_by_qnum: dict, img_by_order: List,
+                      ph_map: dict = None, img_by_key: dict = None,
+                      img_by_ord: dict = None) -> Document:
+    """Chuyển JSON dict từ Gemini thành Document model.
+    img_by_ord: {thứ tự câu trong file: [Image]} — dự phòng khi placeholder bị AI làm rơi."""
     doc = Document()
     doc.title = data.get('title', title)
     attached = set()   # filename ảnh đã gắn vào câu (để biết ảnh nào còn sót)
+    g_ord = 0          # thứ tự câu toàn tài liệu (khớp thứ tự trong markdown)
 
     for sec_data in (data.get('sections') or []):
         sec = Section(
@@ -844,17 +1053,36 @@ def _json_to_document(data: dict, title: str,
                 )
             except (ValueError, TypeError):
                 continue
-            if not q.text:
+            if not q.text and not q.options:
                 continue
             rescue_options_from_text(q)
-            # Gắn ảnh: theo số câu, fallback theo thứ tự
-            if q.number in img_by_qnum:
-                q.images = img_by_qnum[q.number]
-            else:
-                for (stype, order, imgs) in img_by_order:
-                    if stype == sec.type and order == qi:
-                        q.images = imgs
-                        break
+            used = _resolve_img_placeholders(q, ph_map) if ph_map else set()
+            attached |= used
+            my_ord = g_ord
+            g_ord += 1
+            if not used and img_by_ord is not None:
+                for im in img_by_ord.get(my_ord, []):
+                    if im.filename not in attached:
+                        q.images.append(im)
+                        attached.add(im.filename)
+            elif not used:
+                # Gắn ảnh: (loại phần, số câu) → số câu (khi duy nhất) → thứ tự trong phần
+                val = (img_by_key or {}).get((sec.type, q.number))
+                if val is None and img_by_qnum.get(q.number) is not None:
+                    val = img_by_qnum[q.number]
+                if val is None:
+                    for (stype, order, imgs) in img_by_order:
+                        if stype == sec.type and order == qi:
+                            val = imgs
+                            break
+                if val is not None:
+                    _apply_fallback_images(q, val)
+            # "4 phương án là 4 hình": AI báo cờ và số hình khớp số phương án → chia 1:1
+            q.ensure_option_images()
+            if (q_data.get('options_are_figures') and q.images and q.options
+                    and len(q.images) == len(q.options) and not any(q.option_images)):
+                q.option_images = [[im] for im in q.images]
+                q.images = []
             # Chống trùng bảng: AI đã trả bảng Markdown trong text → bỏ ảnh bảng
             # cắt từ PDF của câu này (đánh dấu attached để không rơi vào leftovers)
             if q.images and _MD_TABLE_RE.search(q.text):
@@ -867,13 +1095,24 @@ def _json_to_document(data: dict, title: str,
                 q.images = kept
             for im in q.images:
                 attached.add(im.filename)
+            for lst in q.option_images:
+                for im in lst:
+                    attached.add(im.filename)
             sec.questions.append(q)
         doc.sections.append(sec)
 
     # Ảnh đã trích từ PDF nhưng KHÔNG khớp câu nào (AI đánh số/chia phần khác bộ trích ảnh)
     # → KHÔNG để mất: đưa xuống cuối (giống hành vi cũ "ảnh ở chân trang").
     leftovers, seen = [], set()
-    for imgs in img_by_qnum.values():
+    pools = []
+    for val in list(img_by_qnum.values()) + list((img_by_key or {}).values()) \
+            + list((img_by_ord or {}).values()):
+        if isinstance(val, tuple):
+            pools.append(list(val[0]) + [im for lst in val[1] for im in lst])
+        elif val:
+            pools.append(list(val))
+    pools.append([Image(filename=fn) for fn in (ph_map or {}).values()])
+    for imgs in pools:
         for im in imgs:
             if im.filename not in attached and im.filename not in seen:
                 seen.add(im.filename)
@@ -905,14 +1144,11 @@ def import_with_vision(filepath: str, gemini_key: str) -> Document:
     # Bước 1: Import thông thường để lấy ảnh (để gắn lại sau)
     img_by_qnum: dict = {}
     img_by_order: List = []
+    img_by_key: dict = {}
     fallback_doc: Optional[Document] = None
     try:
         fallback_doc = import_file(filepath)
-        for sec in fallback_doc.sections:
-            for qi, q in enumerate(sec.questions):
-                if q.images:
-                    img_by_qnum[q.number] = list(q.images)
-                    img_by_order.append((sec.type, qi, list(q.images)))
+        img_by_qnum, img_by_order, img_by_key = _collect_fallback_images(fallback_doc)
     except Exception:
         pass
 
@@ -950,7 +1186,7 @@ def import_with_vision(filepath: str, gemini_key: str) -> Document:
         raise RuntimeError('Không parse được JSON từ Gemini.')
 
     try:
-        return _json_to_document(data, title, img_by_qnum, img_by_order)
+        return _json_to_document(data, title, img_by_qnum, img_by_order, img_by_key=img_by_key)
     except Exception:
         if fallback_doc:
             return fallback_doc
@@ -1047,14 +1283,11 @@ def import_with_vision_9router(filepath: str, niner_key: str,
     # Bước 1: import thường để lấy ảnh (gắn lại sau)
     img_by_qnum: dict = {}
     img_by_order: List = []
+    img_by_key: dict = {}
     fallback_doc: Optional[Document] = None
     try:
         fallback_doc = import_file(filepath)
-        for sec in fallback_doc.sections:
-            for qi, q in enumerate(sec.questions):
-                if q.images:
-                    img_by_qnum[q.number] = list(q.images)
-                    img_by_order.append((sec.type, qi, list(q.images)))
+        img_by_qnum, img_by_order, img_by_key = _collect_fallback_images(fallback_doc)
     except Exception:
         pass
 
@@ -1120,7 +1353,7 @@ def import_with_vision_9router(filepath: str, niner_key: str,
 
     try:
         return _json_to_document({'title': title, 'sections': merged_sections},
-                                 title, img_by_qnum, img_by_order)
+                                 title, img_by_qnum, img_by_order, img_by_key=img_by_key)
     except Exception:
         if fallback_doc:
             return fallback_doc
@@ -1204,9 +1437,11 @@ def find_pandoc() -> Optional[str]:
     return None
 
 
-def pandoc_docx_to_markdown(docx_path: str, pandoc_cmd: str) -> Tuple[str, List[str]]:
-    """Dùng Pandoc convert DOCX → Markdown. Trích xuất ảnh ra IMG_DIR.
-    Returns: (markdown_text, [image_filenames_in_order])
+def pandoc_docx_to_markdown(docx_path: str, pandoc_cmd: str) -> Tuple[str, List[str], dict]:
+    """Dùng Pandoc convert DOCX → Markdown. Trích xuất ảnh ra IMG_DIR (mọi ảnh, kể cả
+    WMF/EMF, đều chuyển sang PNG qua PIL — trước đây copy nguyên .wmf → không hiện,
+    không xuất được).
+    Returns: (markdown_text, [saved_filenames_in_order], {tên gốc/stem → tên đã lưu})
     """
     work_dir = os.path.join(IMG_DIR, f'pandoc_{uuid.uuid4().hex[:8]}')
     os.makedirs(work_dir, exist_ok=True)
@@ -1233,21 +1468,27 @@ def pandoc_docx_to_markdown(docx_path: str, pandoc_cmd: str) -> Tuple[str, List[
             try: os.remove(md_path)
             except Exception: pass
 
-    # Copy ảnh được extract ra IMG_DIR
+    # Ảnh extract → PNG trong IMG_DIR (giữ map tên gốc để khớp ![](media/imageN.ext) trong md)
     img_names: List[str] = []
+    name_map: dict = {}
     media_sub = os.path.join(work_dir, 'media')
     if os.path.isdir(media_sub):
         for fname in sorted(os.listdir(media_sub)):
             src = os.path.join(media_sub, fname)
-            if os.path.isfile(src):
-                dst_name = f'{uuid.uuid4().hex[:8]}_{fname}'
-                _shutil.copy2(src, os.path.join(IMG_DIR, dst_name))
-                img_names.append(dst_name)
+            if not os.path.isfile(src):
+                continue
+            stem = os.path.splitext(fname)[0]
+            with open(src, 'rb') as fh:
+                saved = save_image_bytes(fh.read(), f'{uuid.uuid4().hex[:8]}_{stem}')
+            if saved:
+                img_names.append(saved)
+                name_map[fname] = saved
+                name_map[stem] = saved
 
     try: _shutil.rmtree(work_dir)
     except Exception: pass
 
-    return md_content, img_names
+    return md_content, img_names, name_map
 
 
 _KATEX_INJECT = """
@@ -1321,9 +1562,11 @@ def _inject_katex(html_path: str):
         pass
 
 
-def _map_images_to_questions_from_md(md: str, img_names: List[str]) -> dict:
+def _map_images_to_questions_from_md(md: str, img_names: List[str], name_map: dict = None,
+                                     by_ordinal: bool = False) -> dict:
     """Map image → câu hỏi dựa trên vị trí trong markdown.
-    Returns: {question_number: [Image, ...]}
+    Returns: {question_number: [Image, ...]} — hoặc {thứ_tự_câu_trong_file (0-based): [...]}
+    khi by_ordinal=True (số câu reset mỗi PHẦN nên khoá theo số bị trùng; thứ tự thì không).
     """
     if not img_names:
         return {}
@@ -1331,13 +1574,14 @@ def _map_images_to_questions_from_md(md: str, img_names: List[str]) -> dict:
     # Tìm vị trí câu hỏi (Câu N / câu N)
     q_positions: List[Tuple[int, int]] = []
     for m in re.finditer(
-        r'(?:^|\n)[^\S\n]*\*?\*?(?:Câu|câu|C)\s*(\d+)[^0-9]',
+        r'(?:^|\n)[^\S\n]*\*?\*?(?:Câu|câu|C)\s*(\d+)[^0-9]|(?:^|\n)(\d{1,3})\.[ \t]+\S',
         md, re.IGNORECASE
     ):
         try:
-            q_positions.append((int(m.group(1)), m.start()))
-        except ValueError:
-            pass
+            num = int(m.group(1) or m.group(2))
+        except (ValueError, TypeError):
+            continue
+        q_positions.append((len(q_positions) if by_ordinal else num, m.start()))
 
     # Tìm vị trí ảnh trong markdown: ![...](path)
     img_refs: List[Tuple[str, int]] = []
@@ -1356,7 +1600,7 @@ def _map_images_to_questions_from_md(md: str, img_names: List[str]) -> dict:
         return result
 
     # Dùng thứ tự trong md để map ảnh → câu hỏi
-    orig_to_saved: dict = {}
+    orig_to_saved: dict = dict(name_map or {})
     for img_name in img_names:
         # img_name = "abcd1234_image1.png" → match với image1.png trong md
         parts = img_name.split('_', 1)
@@ -1419,7 +1663,10 @@ MARKDOWN_JSON_PROMPT = (
     "- Ví dụ: $\\\\sqrt{2aS}$  $\\\\omega$  $\\\\Delta$  $\\\\vec{v}$\n"
     "- ĐÚNG: \"text\": \"Gia toc $a = \\\\frac{F}{m}$, $v^2 = v_0^2 + 2aS$\"\n"
     "- SAI:  \"text\": \"Gia toc $a = \\frac{F}{m}$\"  ← một backslash → JSON lỗi\n\n"
-    "Bỏ qua: header trường, tên đề, mã đề, ngày tháng, câu lệnh ảnh ![...]\n\n"
+    "HÌNH: ký hiệu {{IMG_n}} là một hình trong đề — GIỮ NGUYÊN {{IMG_n}} đúng vị trí:\n"
+    "  hình nằm trong phương án → để trong phương án đó (\"A. {{IMG_3}}\"), hình của đề → để\n"
+    "  trong \"text\". TUYỆT ĐỐI KHÔNG bỏ, KHÔNG gộp, KHÔNG đổi số n.\n"
+    "Bỏ qua: header trường, tên đề, mã đề, ngày tháng\n\n"
     "Nội dung Markdown:\n"
 )
 
@@ -1480,13 +1727,19 @@ def import_docx_pandoc(filepath: str, gemini_key: str = '') -> Tuple[Document, O
     os.makedirs(orig_dir, exist_ok=True)
 
     # Bước 1: Pandoc → markdown + images
-    md_content, img_names = pandoc_docx_to_markdown(filepath, pandoc_cmd)
+    md_content, img_names, name_map = pandoc_docx_to_markdown(filepath, pandoc_cmd)
 
     if not md_content.strip():
         raise ValueError('Pandoc không trích xuất được nội dung từ file.')
 
-    # Map ảnh → câu hỏi
-    img_map = _map_images_to_questions_from_md(md_content, img_names)
+    # Span thuộc tính của Pandoc "**[A.]{.underline}**" → "**A.**" (regex phương án mới nhận được)
+    md_content = re.sub(r'\[([^\[\]\n]*)\]\{[^{}\n]*\}', r'\1', md_content)
+
+    # Map ảnh → câu hỏi theo VỊ TRÍ/THỨ TỰ câu (dự phòng khi AI làm rơi placeholder);
+    # không khoá theo số câu vì số reset mỗi PHẦN → câu 1 Phần II từng nhận hình câu 1 Phần I
+    img_map = _map_images_to_questions_from_md(md_content, img_names, name_map, by_ordinal=True)
+    # Hình → {{IMG_n}} giữ đúng vị trí (trong phương án → hình của phương án đó)
+    md_content, ph_map = _inject_img_placeholders(md_content, name_map)
 
     # Bước 2: Pandoc → HTML để hiển thị panel trái
     html_name = pandoc_docx_to_html(filepath, pandoc_cmd, orig_dir)
@@ -1497,13 +1750,13 @@ def import_docx_pandoc(filepath: str, gemini_key: str = '') -> Tuple[Document, O
             raw_json = _call_gemini_text_json(md_content, gemini_key)
             data = _extract_and_parse_json(raw_json)
             if data:
-                doc = _json_to_document(data, title, img_map, [])
+                doc = _json_to_document(data, title, {}, [], ph_map=ph_map, img_by_ord=img_map)
                 return doc, html_name
         except Exception as e:
             print(f'[Gemini text fallback] {e}', flush=True)
 
     # Fallback: parse markdown trực tiếp bằng regex
-    doc = _parse_markdown_as_document(md_content, title, img_map)
+    doc = _parse_markdown_as_document(md_content, title, img_map, ph_map)
     return doc, html_name
 
 
@@ -1543,7 +1796,8 @@ def _md_tables_to_lines(lines: List[str]) -> List[str]:
     return out
 
 
-def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
+def _parse_markdown_as_document(md: str, title: str, img_map: dict,
+                                ph_map: dict = None) -> Document:
     """Parse pandoc markdown → Document model (không cần Gemini).
     Dùng khi Gemini không khả dụng.
     """
@@ -1569,6 +1823,9 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
         r'^(?:\*{1,2})?(?:C[ÂÂâ]u|Cau|cau)\s*(\d+)[\s.):]*\*{0,2}\s*(.*)',
         re.IGNORECASE | re.UNICODE
     )
+    # Đề đánh số bằng danh sách Word ("1.  Hãy tìm…" — Pandoc xuất "N." + 2 khoảng
+    # trắng), không có chữ "Câu" → trước đây 0 câu, mọi hình thành thừa
+    NUM_Q_RE = re.compile(r'^(\d{1,3})\.[ \t]+(\S.*)')
     # Bullet '- '/'* ' phía trước (chữ * của **A.** không phải bullet vì không có space)
     OPTION_RE = re.compile(
         r'^(?:\s*[-*+]\s+)?' + _OPT_MARK + r'\s*(.*)',
@@ -1583,6 +1840,11 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
         nonlocal current_q
         if current_q and current_sec:
             rescue_options_from_text(current_q)
+            if ph_map:
+                used = _resolve_img_placeholders(current_q, ph_map)
+                if not used and not current_q.images and (q_counter - 1) in img_map:
+                    current_q.images = list(img_map[q_counter - 1])
+            current_q.ensure_option_images()
             current_sec.questions.append(current_q)
         current_q = None
 
@@ -1595,7 +1857,10 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
     lines = _md_tables_to_lines(lines)
 
     for raw_line in lines:
-        line = raw_line.strip()
+        # Pandoc bọc phương án thụt lề trong blockquote "> **A.** …" → bỏ dấu >;
+        # gỡ escape markdown của Pandoc: \[HTT\] → [HTT], a\) → a), 10\. → 10.
+        line = re.sub(r'^(?:\s*>)+\s?', '', raw_line).strip()
+        line = re.sub(r'\\([\[\]()*_#>~.])', r'\1', line)
         # Bỏ qua dòng ảnh (![...](...)  )
         if re.match(r'!\[.*?\]\(.*?\)', line):
             continue
@@ -1607,8 +1872,10 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
         # Bỏ dấu # header
         clean_no_hash = re.sub(r'^#+\s*', '', clean).strip()
 
-        # Section header?
-        if SECTION_HEADER_RE.search(clean_no_hash):
+        # Section header? (ngắn, KHÔNG phải dòng câu hỏi — đề Đúng-Sai dài chứa
+        # "…đúng hay sai" từng bị coi là tiêu đề phần → câu + hình rơi vào intro)
+        if SECTION_HEADER_RE.search(clean_no_hash) and len(clean_no_hash) < 120 \
+                and not QUESTION_RE.match(clean) and not NUM_Q_RE.match(line):
             flush_question()
             flush_section()
             stype = detect_section_type(clean_no_hash) or 'khac'
@@ -1616,8 +1883,8 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
             q_counter = 0
             continue
 
-        # Câu hỏi?
-        m = QUESTION_RE.match(clean)
+        # Câu hỏi? ("Câu N" hoặc danh sách đánh số "N.  …")
+        m = QUESTION_RE.match(clean) or NUM_Q_RE.match(line)
         if m:
             flush_question()
             if current_sec is None:
@@ -1626,8 +1893,8 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
             qnum = int(m.group(1))
             qtext = m.group(2).strip()
             current_q = Question(number=qnum, text=qtext)
-            if qnum in img_map:
-                current_q.images = img_map[qnum]
+            if qnum in img_map and not ph_map:
+                current_q.images = list(img_map[qnum])
             continue
 
         # Đáp án A/B/C/D? (một dòng có thể chứa 2–4 phương án)

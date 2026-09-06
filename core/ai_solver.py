@@ -99,7 +99,14 @@ def _build_full_prompt(doc: Document, only_ids: set = None) -> tuple[str, dict]:
             lines.append(f"\n[CÂU {gnum}]")
             lines.append(q.text)
             if q.options:
-                lines.append("  " + "  ".join(q.options))
+                oi = getattr(q, 'option_images', None) or []
+                opts = []
+                for i, o in enumerate(q.options):
+                    if i < len(oi) and oi[i]:
+                        mo = re.match(r'\s*\**\(?([A-D])', o)
+                        o = f"{o} [HÌNH {mo.group(1) if mo else chr(65 + i)}]"
+                    opts.append(o)
+                lines.append("  " + "  ".join(opts))
             if q.sub_items:
                 for sub in q.sub_items:
                     lines.append(f"  {sub}")
@@ -368,6 +375,10 @@ BƯỚC 3 — Quy trình HAI bước (bóc tách dữ liệu TRƯỚC, giải to
 (a) BÓC TÁCH từ đồ thị: biên độ A, chu kỳ T, ω = 2π/T, pha ban đầu φ, giá trị tại các mốc.
 (b) Có đủ dữ liệu RỒI mới GIẢI TOÁN để ra đáp án.
 
+CÂU "4 PHƯƠNG ÁN LÀ 4 ĐỒ THỊ/HÌNH": mỗi ảnh được gửi ngay sau nhãn "Phương án A/B/C/D (hình):".
+Từ dữ kiện đề suy ra đồ thị/hình ĐÚNG phải có đặc điểm gì (dạng đường, dấu, độ dốc, giá trị
+tại mốc), rồi đối chiếu TỪNG phương án, loại các phương án sai, kết luận "=> Chọn X".
+
 Trả về ĐÚNG định dạng (KHÔNG thêm text ngoài, KHÔNG ghi <thinking>):
 [CÂU <số>]
 <Đây là bài ĐỒ THỊ/TÍNH TOÁN → trình bày kiểu TỐI GIẢN:
@@ -378,24 +389,64 @@ Trả về ĐÚNG định dạng (KHÔNG thêm text ngoài, KHÔNG ghi <thinking
  - Công thức bọc $...$ (CHỈ $...$, KHÔNG $$).>"""
 
 
+def _q_has_images(q) -> bool:
+    return bool(q.images) or any(bool(x) for x in (getattr(q, 'option_images', None) or []))
+
+
+def _png_bytes(b: bytes) -> bytes | None:
+    """Ảnh gửi AI phải là PNG/JPEG thật — file .wmf cũ (hoặc .png ruột WMF) → PNG."""
+    try:
+        from PIL import Image as PILImage
+        import io as _io
+        im = PILImage.open(_io.BytesIO(b))
+        if im.format in ('PNG', 'JPEG'):
+            return b
+        try:
+            im.load(dpi=300)
+        except TypeError:
+            im.load()
+        if im.mode != 'RGB':
+            im = im.convert('RGB')
+        out = _io.BytesIO()
+        im.save(out, 'PNG')
+        return out.getvalue()
+    except Exception:
+        return None
+
+
 def _vision_solve_one(q: Question, model: str,
                       niner_key: str = '', niner_url: str = 'http://localhost:20128/v1',
                       gemini_key: str = '', scope_text: str = '') -> str | None:
-    """Giải 1 câu CÓ HÌNH bằng Vision (gửi kèm ảnh). Trả lời giải hoặc None."""
+    """Giải 1 câu CÓ HÌNH bằng Vision (gửi kèm ảnh). Hình của từng PHƯƠNG ÁN (câu
+    "4 phương án là 4 đồ thị") gửi kèm nhãn "Phương án X:" ngay trước ảnh để model
+    biết ảnh nào của phương án nào. Trả lời giải hoặc None."""
     import os, base64
     from config import UPLOAD_DIR
     img_dir = os.path.join(UPLOAD_DIR, 'images')
-    blobs = []
+
+    def _read(fn):
+        p = os.path.join(img_dir, fn)
+        if not os.path.exists(p):
+            return None
+        try:
+            with open(p, 'rb') as f:
+                return _png_bytes(f.read())
+        except Exception:
+            return None
+
+    labeled = []                          # (nhãn, bytes)
     for im in q.images:
-        p = os.path.join(img_dir, im.filename)
-        if os.path.exists(p):
-            try:
-                with open(p, 'rb') as f:
-                    blobs.append(f.read())
-            except Exception:
-                pass
-    if not blobs:
+        b = _read(im.filename)
+        if b:
+            labeled.append(('', b))
+    for i, lst in enumerate(getattr(q, 'option_images', None) or []):
+        for im in lst or []:
+            b = _read(im.filename)
+            if b:
+                labeled.append((f'Phương án {chr(65 + i)} (hình):', b))
+    if not labeled:
         return None
+    blobs = [b for _, b in labeled]
 
     qtext = f"[CÂU {q.number}]\n{q.text}"
     if q.options:
@@ -412,7 +463,9 @@ def _vision_solve_one(q: Question, model: str,
         client = OpenAI(api_key=niner_key or '9router', base_url=niner_url,
                         timeout=180, max_retries=0)
         content = [{"type": "text", "text": qtext}]
-        for b in blobs:
+        for label, b in labeled:
+            if label:
+                content.append({"type": "text", "text": label})
             content.append({"type": "image_url", "image_url": {
                 "url": "data:image/png;base64," + base64.b64encode(b).decode()}})
         resp = client.chat.completions.create(
@@ -435,7 +488,11 @@ def _vision_solve_one(q: Question, model: str,
             genai.configure(api_key=gemini_key)
             gm = genai.GenerativeModel('gemini-2.5-flash',
                                        system_instruction=VISION_PHYSICS_PROMPT)
-            parts = [qtext] + [{"mime_type": "image/png", "data": b} for b in blobs]
+            parts = [qtext]
+            for label, b in labeled:
+                if label:
+                    parts.append(label)
+                parts.append({"mime_type": "image/png", "data": b})
             resp = gm.generate_content(parts, request_options={'timeout': 120})
             return _vision_clean((resp.text or '').strip(), q.number)
         except Exception:
@@ -469,7 +526,7 @@ def _solve_image_questions(doc: Document, model: str,
     from core.chuong_trinh import build_scope_prompt
 
     img_qs = [q for s in doc.sections if not s.is_theory
-              for q in s.questions if q.images]
+              for q in s.questions if _q_has_images(q)]
     if not img_qs:
         return {}
     scope_text = build_scope_prompt(getattr(doc, 'ai_scope', None))
@@ -639,7 +696,7 @@ def stream_solve_document(doc: Document,
     # Câu CÓ HÌNH/ĐỒ THỊ → giải lại bằng Vision (3 bước tư duy), đè lên đáp án text
     try:
         img_qs = [q for s in doc.sections if not s.is_theory
-                  for q in s.questions if q.images]
+                  for q in s.questions if _q_has_images(q)]
         if img_qs:
             yield {'type': 'chunk',
                    'text': f"\n\n⏳ Đang giải {len(img_qs)} câu có hình/đồ thị bằng Vision…\n"}

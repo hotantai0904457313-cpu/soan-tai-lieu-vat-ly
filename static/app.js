@@ -420,6 +420,34 @@ function renderEditorPanel(doc, opts = {}) {
 }
 
 // Upload 1 ảnh (blob/file) lên server → gắn vào q.images → vẽ lại editor
+// option_images song song với options (tài liệu cũ không có trường này)
+function ensureOptionImages(q) {
+  const n = (q.options || []).length;
+  q.option_images = (q.option_images || []).slice(0, n).map(x => Array.isArray(x) ? x : []);
+  while (q.option_images.length < n) q.option_images.push([]);
+  return q.option_images;
+}
+
+async function addImageToOption(q, idx, blob) {
+  if (!blob) return;
+  try {
+    showToast('Đang tải ảnh lên…', 'info', 1500);
+    const fd = new FormData();
+    fd.append('file', blob, 'paste.png');
+    const r = await fetch('/api/images', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (!r.ok || !data.filename) throw new Error(data.error || 'Lỗi tải ảnh');
+    ensureOptionImages(q);
+    q.option_images[idx].push({ id: (data.filename || '').slice(0, 8), filename: data.filename,
+                                width: data.width || 0, height: data.height || 0, caption: '' });
+    markUnsaved();
+    renderEditorPanel(state.currentDoc, { preserveUnsaved: true, preserveScroll: true });
+    showToast('Đã thêm hình cho phương án ' + getLetter(idx), 'success');
+  } catch (e) {
+    showToast('Không thêm được ảnh: ' + e.message, 'error');
+  }
+}
+
 async function addImageToQuestion(q, blob) {
   if (!blob) return;
   try {
@@ -553,8 +581,40 @@ function buildQuestionCard(q, secIdx, qIdx) {
       });
       textDiv.addEventListener('blur', () => rerenderMath(textDiv));
 
+      // Hình của phương án (câu "4 phương án là 4 đồ thị"): thumbnail + ✕ + nút thêm
+      ensureOptionImages(q);
+      const optImgs = el('div', 'q-opt-images');
+      (q.option_images[idx] || []).forEach((img, j) => {
+        const w = el('span', 'q-opt-img');
+        const im = document.createElement('img');
+        im.src = `/api/images/${img.filename}`;
+        im.title = 'Hình của phương án ' + getLetter(idx) + ' — bấm để phóng to';
+        im.addEventListener('click', () => zoomImage(im.src));
+        const x = el('button', 'q-opt-img-x', '✕');
+        x.title = 'Bỏ hình này';
+        x.addEventListener('click', (e) => {
+          e.stopPropagation();
+          q.option_images[idx].splice(j, 1);
+          markUnsaved();
+          renderEditorPanel(state.currentDoc, { preserveUnsaved: true, preserveScroll: true });
+        });
+        w.appendChild(im); w.appendChild(x); optImgs.appendChild(w);
+      });
+      const addImg = el('button', 'q-opt-img-add', '🖼');
+      addImg.title = 'Thêm hình cho phương án ' + getLetter(idx);
+      addImg.addEventListener('click', () => {
+        const inp = document.createElement('input');
+        inp.type = 'file'; inp.accept = 'image/*';
+        inp.addEventListener('change', () => {
+          if (inp.files && inp.files[0]) addImageToOption(q, idx, inp.files[0]);
+        });
+        inp.click();
+      });
+      optImgs.appendChild(addImg);
+
       row.appendChild(marker);
       row.appendChild(textDiv);
+      row.appendChild(optImgs);
       optsDiv.appendChild(row);
     });
     card.appendChild(optsDiv);

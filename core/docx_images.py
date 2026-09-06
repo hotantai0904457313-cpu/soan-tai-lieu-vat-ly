@@ -91,67 +91,48 @@ def _para_text(para) -> str:
 
 
 def extract_paragraph_images(docx_path: str) -> tuple:
-    """Quét đoạn văn top-level (bỏ ô bảng) → danh sách ảnh theo thứ tự.
+    """Quét TOÀN BỘ tài liệu theo thứ tự (đoạn văn, ô bảng, textbox, content control)
+    → danh sách ảnh theo thứ tự — qua core.docx_walk (inline/anchor/VML/nhóm/bảng).
 
     Trả (items, n_in_tables) — mỗi item:
       {'blob', 'w_cm', 'h_cm', 'ctx', 'q_local'}
+    n_in_tables = số ảnh nằm trong ô bảng (giờ ĐÃ lấy, chỉ để báo cho thầy biết).
     """
     from docx import Document as DocxDoc
+    from core.docx_walk import walk_docx
 
     doc = DocxDoc(docx_path)
-    part = doc.part
     items: List[dict] = []
-    seen_rids_body = set()
-
     cur_q: Optional[int] = None
     recent_text: List[str] = []
+    n_in_tables = 0
 
-    for para in doc.paragraphs:
-        text = _para_text(para)
+    def _feed(text: str, images: list, in_table: bool):
+        nonlocal cur_q, recent_text, n_in_tables
+        text = (text or '').strip()
         if text:
             m = _Q_LABEL_RE.match(text)
             if m:
                 cur_q = int(m.group(1) or m.group(2))
             recent_text.append(text)
             recent_text = recent_text[-3:]
-
-        last_extent = None
-        for elem in para._p.iter():
-            if elem.tag == _TAG_EXTENT:
-                last_extent = elem
+        for im in images or []:
+            blob = im.get('blob')
+            if not blob:
                 continue
-            rid = None
-            if elem.tag == _TAG_BLIP:
-                rid = elem.get(_NS_R + 'embed')
-            elif elem.tag == _TAG_VML:
-                rid = elem.get(_NS_R + 'id')
-            if not rid:
-                continue
-            seen_rids_body.add(rid)
-            try:
-                blob = part.related_parts[rid].blob
-            except Exception:
-                continue
-            w_cm = h_cm = None
-            if last_extent is not None:
-                try:
-                    w_cm = int(last_extent.get('cx')) / _EMU_PER_CM
-                    h_cm = int(last_extent.get('cy')) / _EMU_PER_CM
-                except (TypeError, ValueError):
-                    w_cm = h_cm = None
+            if in_table:
+                n_in_tables += 1
             ctx = ' '.join(recent_text)[-_CTX_CHARS:]
-            items.append({'blob': blob, 'w_cm': w_cm, 'h_cm': h_cm,
+            items.append({'blob': blob, 'w_cm': im.get('width_cm'), 'h_cm': im.get('height_cm'),
                           'ctx': ctx, 'q_local': cur_q})
 
-    # Đếm ảnh nằm trong bảng (không lấy, nhưng phải báo để thầy biết)
-    n_in_tables = 0
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    for elem in para._p.iter():
-                        if elem.tag == _TAG_BLIP or elem.tag == _TAG_VML:
-                            n_in_tables += 1
+    for it in walk_docx(doc):
+        if it['kind'] == 'p':
+            _feed(it['text'], it['images'], False)
+        else:
+            for row in it['cells']:
+                for c in row:
+                    _feed(c['text'], c['images'], True)
     return items, n_in_tables
 
 
@@ -321,8 +302,9 @@ def extract_question_images(docx_path: str, out_path: str, title: str,
     """Đầu vào .docx bài tập → .docx chỉ gồm số câu + hình đã làm nét."""
     items, n_tables = extract_paragraph_images(docx_path)
     if not items:
-        raise ValueError('Không tìm thấy hình nào trong file (ngoài bảng). '
-                         'Nếu hình nằm trong bảng, hãy báo để bật chế độ quét bảng.')
+        raise ValueError('Không tìm thấy hình nào trong file (đã quét cả đoạn văn, ô bảng, '
+                         'textbox). Hình vẽ bằng Shapes/SmartArt của Word không phải ảnh nên '
+                         'không tách được.')
     method = assign_questions(items, gemini_key, niner_url, niner_key)
     stats = build_images_docx(items, out_path, title, level)
     stats['hinh_trong_bang'] = n_tables

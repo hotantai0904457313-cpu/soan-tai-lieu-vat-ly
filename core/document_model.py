@@ -37,9 +37,12 @@ class Image:
         return {'id': self.id, 'filename': self.filename,
                 'width': self.width, 'height': self.height, 'caption': self.caption}
 
+    _KEYS = ('id', 'filename', 'width', 'height', 'caption')
+
     @staticmethod
     def from_dict(d: Dict) -> 'Image':
-        return Image(**d)
+        # Lọc key lạ — Image(**d) từng vỡ khi JSON có thêm trường
+        return Image(**{k: v for k, v in (d or {}).items() if k in Image._KEYS})
 
 
 @dataclass
@@ -53,7 +56,22 @@ class Question:
     ai_solution: str = ''
     show_solution: bool = True
     images: List[Image] = field(default_factory=list)
+    # Hình của TỪNG phương án, song song với options (câu "4 phương án là 4 đồ thị").
+    # Rỗng/thiếu → coi như phương án không có hình (tương thích tài liệu cũ).
+    option_images: List[List[Image]] = field(default_factory=list)
     raw_html: str = ''   # HTML gốc từ file import
+
+    def ensure_option_images(self) -> List[List[Image]]:
+        """Đưa option_images về đúng độ dài options (thêm [] / cắt bớt)."""
+        n = len(self.options)
+        oi = [list(x or []) for x in (self.option_images or [])][:n]
+        while len(oi) < n:
+            oi.append([])
+        self.option_images = oi
+        return oi
+
+    def has_images(self) -> bool:
+        return bool(self.images) or any(bool(x) for x in (self.option_images or []))
 
     def to_dict(self) -> Dict:
         return {
@@ -66,6 +84,8 @@ class Question:
             'ai_solution': self.ai_solution,
             'show_solution': self.show_solution,
             'images': [img.to_dict() for img in self.images],
+            'option_images': [[img.to_dict() for img in (lst or [])]
+                              for lst in (self.option_images or [])],
             'raw_html': self.raw_html,
         }
 
@@ -83,6 +103,8 @@ class Question:
             raw_html=d.get('raw_html', ''),
         )
         q.images = [Image.from_dict(i) for i in d.get('images', [])]
+        q.option_images = [[Image.from_dict(i) for i in (lst or [])]
+                           for lst in (d.get('option_images') or [])]
         return q
 
 

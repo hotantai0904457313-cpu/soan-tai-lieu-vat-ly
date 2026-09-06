@@ -357,11 +357,22 @@ body {
 .q-option-row {
   display: flex;
   align-items: flex-start;
+  flex-wrap: wrap;
   gap: 6px;
   border-radius: 5px;
   padding: 3px 6px;
   transition: background .12s;
 }
+/* Hình theo phương án (4 đồ thị) — dải thumbnail dưới chữ phương án */
+.q-opt-images { display: flex; align-items: center; gap: 6px; flex-basis: 100%; padding-left: 30px; }
+.q-opt-images:empty { display: none; }
+.q-opt-img { position: relative; display: inline-block; }
+.q-opt-img img { height: 90px; max-width: 220px; border: 1px solid #d5dbe6; border-radius: 4px; cursor: zoom-in; display: block; background: #fff; }
+.q-opt-img-x { position: absolute; top: 2px; right: 2px; width: 18px; height: 18px; border: none; border-radius: 50%;
+  background: rgba(0,0,0,.6); color: #fff; font-size: 11px; line-height: 18px; padding: 0; cursor: pointer; }
+.q-opt-img-add { border: 1px dashed #b8c2d6; background: transparent; border-radius: 4px; cursor: pointer;
+  font-size: 14px; padding: 2px 6px; opacity: .55; }
+.q-opt-img-add:hover { opacity: 1; background: var(--navy-light); }
 .q-option-row:hover { background: var(--navy-light); }
 .q-option-row.correct {
   background: #f0fdf4;
