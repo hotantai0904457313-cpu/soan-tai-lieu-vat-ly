@@ -45,29 +45,72 @@ QUESTION_PATTERN = re.compile(
     r'^(?=c[aâ]u\s*\d|\d+\s*[.)])(?:c[aâ]u\s*)?(\d+)\s*[.):\s]\s*(.+)',
     re.IGNORECASE | re.UNICODE | re.DOTALL)
 
+# Dấu phương án A–D, chịu được: 'A.', 'A)', 'A:', 'A-', '(A)', '**A.**', 'A\.'
+# (Pandoc escape dấu chấm đầu dòng để không thành list). Nhóm 1 = chữ cái.
+# Dòng không khớp sẽ bị NỐI VÀO ĐỀ → phương án "nhảy lên đề" — nên phải rộng.
+_OPT_MARK = r'\*{0,2}\(?([A-D])\*{0,2}(?:\)|\s*\\?[.):\-])\*{0,2}'
 OPTION_PATTERN = re.compile(
-    r'^([A-D])\s*[.):\-]\s*(.+)', re.UNICODE | re.DOTALL)
+    r'^' + _OPT_MARK + r'\s*(.+)', re.UNICODE | re.DOTALL)
 
 SUB_ITEM_PATTERN = re.compile(
     r'^([a-d])\s*\\?[.)]\s*(.+)', re.UNICODE | re.DOTALL)  # \\? handles Pandoc \)
 
 MULTI_OPTION_PATTERN = re.compile(
-    r'([A-D])\s*[.):\-]\s*((?:(?![A-D]\s*[.):\-]).)+)',
+    _OPT_MARK + r'\s*((?:(?!\*{0,2}\(?[A-D]\*{0,2}(?:\)|\s*\\?[.):\-])).)+)',
     re.UNICODE)
+
+
+def _ascending(letters: List[str]) -> bool:
+    """A,B,C,D / C,D … liên tiếp tăng dần (chặn tách nhầm 'điểm B. … điểm A.')."""
+    return all(ord(b) == ord(a) + 1 for a, b in zip(letters, letters[1:]))
 
 
 def split_multi_options(line: str) -> List[str]:
     matches = list(MULTI_OPTION_PATTERN.finditer(line))
     if len(matches) < 2:
         return [line]
+    letters = [m.group(1).upper() for m in matches]
+    if not _ascending(letters):
+        return [line]
     opts = []
     for i, m in enumerate(matches):
-        letter = m.group(1).upper()
+        letter = letters[i]
         start = m.start(2)
         end = matches[i+1].start() if i+1 < len(matches) else len(line)
         text = line[start:end].strip()
         opts.append(f'{letter}. {text}')
     return opts
+
+
+def split_options_from_text(text: str, options) -> Tuple[str, List[str]]:
+    """THUẦN (không ghi đè): nếu câu chưa có phương án mà đề chứa khối A./B./C./D.
+    tăng dần từ A → trả (đề đã cắt, danh sách phương án). Ngược lại trả nguyên."""
+    options = list(options or [])
+    if len(options) >= 2 or not text:
+        return text, options
+    matches = list(MULTI_OPTION_PATTERN.finditer(text))
+    if len(matches) < 2:
+        return text, options
+    letters = [m.group(1).upper() for m in matches]
+    if letters[0] != 'A' or not _ascending(letters):
+        return text, options
+    first = matches[0]
+    # Chữ A phải đứng đầu chuỗi hoặc sau khoảng trắng/xuống dòng
+    if first.start() > 0 and not text[first.start() - 1].isspace():
+        return text, options
+    opts = split_multi_options(text[first.start():])
+    if len(opts) < 2:
+        return text, options
+    return text[:first.start()].rstrip(), opts
+
+
+def rescue_options_from_text(q) -> bool:
+    """Ghi đè lên q: cứu phương án bị nuốt vào q.text. Trả True nếu có sửa."""
+    text, opts = split_options_from_text(q.text, q.options)
+    if text == q.text and opts == list(q.options):
+        return False
+    q.text, q.options = text, opts
+    return True
 
 
 def detect_section_type(text: str) -> Optional[str]:
@@ -248,6 +291,51 @@ def _extract_table_images(page, page_num: int):
     return table_imgs, table_rects
 
 
+def _page_text_lines(page, inside_table) -> List[dict]:
+    """Dòng chữ của trang theo ĐÚNG thứ tự đọc: bbox từng DÒNG (get_text('dict')),
+    sắp theo (cột, y, x). Trước đây sắp theo y-tâm-của-cả-block → đề 2 cột bị trộn
+    và mọi dòng trong 1 block chung 1 y (phương án nhảy lên trên đề)."""
+    lines = []
+    try:
+        d = page.get_text('dict')
+    except Exception:
+        d = {'blocks': []}
+    for b in d.get('blocks', []):
+        if b.get('type', 0) != 0:
+            continue
+        for ln in b.get('lines', []):
+            text = ''.join(sp.get('text', '') for sp in ln.get('spans', [])).strip()
+            if not text:
+                continue
+            x0, y0, x1, y1 = ln.get('bbox', (0, 0, 0, 0))
+            if inside_table((x0, y0, x1, y1)):
+                continue   # đã thành ảnh bảng — bỏ text vỡ
+            lines.append({'y': (y0 + y1) / 2, 'x': x0, 'x1': x1,
+                          'text': text, 'imgs': []})
+    if not lines:
+        return lines
+    # Đề 2 cột: mỗi nửa có ≥8 dòng nằm trọn, chiếm ≥30% số dòng và phủ ≥35%
+    # chiều cao trang — lưới phương án "A. … B. …" 2 cái/dòng chỉ có vài dòng
+    # bên phải, KHÔNG phải 2 cột
+    mid = page.rect.width / 2
+    left = [l for l in lines if l['x1'] <= mid + 5]
+    right = [l for l in lines if l['x'] >= mid - 5]
+
+    def _span(ls):
+        return (max(l['y'] for l in ls) - min(l['y'] for l in ls)) if ls else 0
+    min_h = 0.35 * page.rect.height
+    two_col = (len(left) >= 8 and len(right) >= 8
+               and len(left) >= 0.3 * len(lines) and len(right) >= 0.3 * len(lines)
+               and _span(left) >= min_h and _span(right) >= min_h)
+    if two_col:
+        for l in lines:
+            l['col'] = 1 if l['x'] >= mid - 5 else 0
+        lines.sort(key=lambda l: (l['col'], round(l['y'], 1), l['x']))
+    else:
+        lines.sort(key=lambda l: (round(l['y'], 1), l['x']))
+    return lines
+
+
 def import_pdf(filepath: str) -> Document:
     import fitz
 
@@ -277,16 +365,7 @@ def import_pdf(filepath: str) -> Document:
                         return True
                 return False
 
-            blocks = page.get_text('blocks')
-            text_blocks = []
-            for b in blocks:
-                if b[6] == 0:
-                    if _inside_table(b):
-                        continue   # đã thành ảnh bảng — bỏ text vỡ
-                    lines = [l.strip() for l in b[4].split('\n') if l.strip()]
-                    for line in lines:
-                        text_blocks.append({'y': (b[1]+b[3])/2, 'text': line, 'imgs': []})
-            text_blocks.sort(key=lambda x: x['y'])
+            text_blocks = _page_text_lines(page, _inside_table)
 
             # Gắn ảnh bảng vào dòng text gần nhất PHÍA TRÊN bảng (câu dẫn)
             for tinfo in table_imgs:
@@ -376,7 +455,9 @@ def _build_sections_from_items(doc: Document, items: List[Tuple[str, List[str]]]
 
     def flush_question():
         nonlocal current_question
-        if current_question and current_question.text and current_section:
+        if current_question and current_section and (
+                current_question.text or current_question.options or current_question.images):
+            rescue_options_from_text(current_question)
             current_section.questions.append(current_question)
             current_question = None
 
@@ -509,6 +590,9 @@ VISION_JSON_PROMPT = (
     '"sub_items":["a) ...","b) ...","c) ...","d) ..."]}]}]}\n\n'
     "Giá trị hợp lệ cho type: trac_nghiem_lua_chon | dung_sai | tra_loi_ngan | tu_luan | ly_thuyet | khac\n"
     '"options": chỉ có khi câu hỏi có lựa chọn A/B/C/D — điền đủ 4 đáp án, không bỏ qua.\n'
+    'Phương án A/B/C/D PHẢI nằm trong "options", TUYỆT ĐỐI không để trong "text".\n'
+    "Bảng/lưới 2×2 mà mọi ô bắt đầu bằng A./B./C./D. là BẢNG PHƯƠNG ÁN (không phải bảng số liệu)\n"
+    '→ tách từng ô thành 1 phần tử của "options".\n'
     '"sub_items": chỉ có khi câu hỏi có mục a/b/c/d (phần đúng-sai) — điền đủ.\n\n'
     "QUY TẮC BẢNG SỐ LIỆU (KHÔNG ĐƯỢC BỎ BẢNG — mất bảng là mất dữ kiện đề):\n"
     "Câu hỏi có BẢNG (bảng số liệu thí nghiệm, bảng giá trị đo, bảng dữ kiện cho đề):\n"
@@ -762,6 +846,7 @@ def _json_to_document(data: dict, title: str,
                 continue
             if not q.text:
                 continue
+            rescue_options_from_text(q)
             # Gắn ảnh: theo số câu, fallback theo thứ tự
             if q.number in img_by_qnum:
                 q.images = img_by_qnum[q.number]
@@ -1320,7 +1405,10 @@ MARKDOWN_JSON_PROMPT = (
     '{"number":<int>,"text":"<nội dung câu, GIỮ NGUYÊN LaTeX $...$>","options":["A. ...","B. ...","C. ...","D. ..."],'
     '"sub_items":["a) ...","b) ...","c) ...","d) ..."]}]}]}\n\n'
     "type: trac_nghiem_lua_chon | dung_sai | tra_loi_ngan | tu_luan | ly_thuyet | khac\n"
-    "options: chỉ điền khi có A/B/C/D. sub_items: chỉ điền khi có a/b/c/d\n\n"
+    "options: chỉ điền khi có A/B/C/D. sub_items: chỉ điền khi có a/b/c/d\n"
+    'Phương án A/B/C/D PHẢI nằm trong "options", TUYỆT ĐỐI không để trong "text".\n'
+    "Bảng Markdown mà mọi ô bắt đầu bằng A./B./C./D. là BẢNG PHƯƠNG ÁN → tách từng ô\n"
+    'thành 1 phần tử "options" (không phải bảng số liệu).\n\n'
     "BẢNG SỐ LIỆU: câu hỏi có bảng Markdown (các dòng | ... |) → GIỮ NGUYÊN bảng\n"
     'trong "text" của câu, mỗi hàng bảng 1 dòng (dùng \\n) — KHÔNG bỏ bảng, KHÔNG\n'
     "gộp bảng thành 1 dòng chữ. Bảng có cột Đ/S (Đúng/Sai) là câu đúng-sai → đưa\n"
@@ -1419,6 +1507,42 @@ def import_docx_pandoc(filepath: str, gemini_key: str = '') -> Tuple[Document, O
     return doc, html_name
 
 
+def _md_table_cells(block: List[str]) -> List[str]:
+    """Ô của bảng Markdown (bỏ dòng kẻ |---|), theo thứ tự đọc."""
+    cells = []
+    for row in block:
+        r = row.strip().strip('|')
+        if re.fullmatch(r'[\s:|\-]+', r):
+            continue
+        cells.extend(c.strip() for c in r.split('|'))
+    return cells
+
+
+def _md_tables_to_lines(lines: List[str]) -> List[str]:
+    """Bảng Markdown mà MỌI ô không rỗng là phương án A./B./C./D. (lưới 2×2 trong
+    Word) → mỗi phương án 1 dòng; bảng khác giữ nguyên các dòng '|…|'."""
+    out, i = [], 0
+    while i < len(lines):
+        if lines[i].strip().startswith('|'):
+            j = i
+            while j < len(lines) and lines[j].strip().startswith('|'):
+                j += 1
+            block = lines[i:j]
+            cells = [c for c in _md_table_cells(block) if c]
+            if 2 <= len(cells) <= 4 and all(OPTION_PATTERN.match(c) for c in cells):
+                letters = [OPTION_PATTERN.match(c).group(1).upper() for c in cells]
+                if _ascending(sorted(letters)) and len(set(letters)) == len(letters):
+                    out.extend(c for _, c in sorted(zip(letters, cells)))
+                    i = j
+                    continue
+            out.extend(block)
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return out
+
+
 def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
     """Parse pandoc markdown → Document model (không cần Gemini).
     Dùng khi Gemini không khả dụng.
@@ -1445,8 +1569,9 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
         r'^(?:\*{1,2})?(?:C[ÂÂâ]u|Cau|cau)\s*(\d+)[\s.):]*\*{0,2}\s*(.*)',
         re.IGNORECASE | re.UNICODE
     )
+    # Bullet '- '/'* ' phía trước (chữ * của **A.** không phải bullet vì không có space)
     OPTION_RE = re.compile(
-        r'^(?:\s*[-*]\s*)?([A-D])\s*[.)]\s*(.*)',
+        r'^(?:\s*[-*+]\s+)?' + _OPT_MARK + r'\s*(.*)',
         re.UNICODE
     )
     SUBITEM_RE = re.compile(
@@ -1457,6 +1582,7 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
     def flush_question():
         nonlocal current_q
         if current_q and current_sec:
+            rescue_options_from_text(current_q)
             current_sec.questions.append(current_q)
         current_q = None
 
@@ -1465,6 +1591,8 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
         if current_sec and (current_sec.questions or current_sec.intro):
             doc.sections.append(current_sec)
         current_sec = None
+
+    lines = _md_tables_to_lines(lines)
 
     for raw_line in lines:
         line = raw_line.strip()
@@ -1502,12 +1630,17 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
                 current_q.images = img_map[qnum]
             continue
 
-        # Đáp án A/B/C/D?
+        # Đáp án A/B/C/D? (một dòng có thể chứa 2–4 phương án)
         m = OPTION_RE.match(line)
         if m and current_q is not None:
-            letter = m.group(1).upper()
-            opt_text = m.group(2).strip()
-            current_q.options.append(f'{letter}. {opt_text}')
+            body = line[m.start(1) - (1 if line[m.start(1) - 1:m.start(1)] == '(' else 0):]
+            parts = split_multi_options(body)
+            if len(parts) >= 2:
+                current_q.options.extend(parts)
+            else:
+                letter = m.group(1).upper()
+                opt_text = m.group(2).strip()
+                current_q.options.append(f'{letter}. {opt_text}')
             continue
 
         # Sub-item a/b/c/d?
@@ -1518,10 +1651,11 @@ def _parse_markdown_as_document(md: str, title: str, img_map: dict) -> Document:
             current_q.sub_items.append(f'{letter}) {sub_text}')
             continue
 
-        # Tiếp nối nội dung câu hỏi
+        # Tiếp nối nội dung câu hỏi (hàng bảng Markdown nối bằng \n để giữ bảng)
         if current_q is not None:
+            sep = '\n' if clean.startswith('|') or current_q.text.endswith('|') else ' '
             if current_q.text:
-                current_q.text += ' ' + clean
+                current_q.text += sep + clean
             else:
                 current_q.text = clean
             continue

@@ -437,21 +437,22 @@ def _format_exam_text(text: str) -> str:
     # 1) Câu/Bài/PHẦN dính cuối dòng trước → xuống dòng (giữ ** nếu có)
     text = re.sub(r'(?<=\S)[ \t]+(\*{0,2}(?:' + _EX_HEADER + r'))', r'\n\1', text)
     # 2) Tách KHỐI đáp án A→B→C→D (đủ 4, đúng thứ tự) — an toàn, không nhầm "vật B."
-    _opt = lambda L: r'\*{0,2}' + L + r'\.(?:\*\*)?[ \t]'
+    _opt = lambda L: r'\*{0,2}\(?' + L + r'\*{0,2}(?:\)|\s*\\?[.):])\*{0,2}[ \t]'
+    # [ \t]*\n?[ \t]* : nuốt xuống dòng sẵn có trước A. để không sinh dòng trống
     text = re.sub(
-        r'[ \t]*(' + _opt('A') + r'.+?)\s+(' + _opt('B') + r'.+?)\s+('
+        r'[ \t]*\n?[ \t]*(' + _opt('A') + r'.+?)\s+(' + _opt('B') + r'.+?)\s+('
         + _opt('C') + r'.+?)\s+(' + _opt('D') + r')',
         lambda m: '\n' + m.group(1) + '\n' + m.group(2) + '\n' + m.group(3) + '\n' + m.group(4),
         text)
     _sub = lambda L: r'\*{0,2}' + L + r'\)(?:\*\*)?[ \t]'
     text = re.sub(
-        r'[ \t]*(' + _sub('a') + r'.+?)\s+(' + _sub('b') + r'.+?)\s+('
+        r'[ \t]*\n?[ \t]*(' + _sub('a') + r'.+?)\s+(' + _sub('b') + r'.+?)\s+('
         + _sub('c') + r'.+?)\s+(' + _sub('d') + r')',
         lambda m: '\n' + m.group(1) + '\n' + m.group(2) + '\n' + m.group(3) + '\n' + m.group(4),
         text)
     # 3) Tô đậm đầu dòng: Câu/Bài, A./B./C./D., a)/b)/c)/d)
     text = re.sub(r'(?<!\*)(C[aâ]u\s+\d+|B[àa]i\s+\d+)(\.|:)(?!\*)', r'**\1\2**', text)
-    text = re.sub(r'(?m)^(?!\*\*)([A-D])\.\s', r'**\1.** ', text)
+    text = re.sub(r'(?m)^(?!\*\*)\(?([A-D])\*{0,2}(?:\)|\s*\\?[.):])\*{0,2}\s', r'**\1.** ', text)
     text = re.sub(r'(?m)^(?!\*\*)([a-d])\)\s', r'**\1)** ', text)
     return text
 
@@ -491,7 +492,9 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
     from docx.oxml import OxmlElement
     import shutil
     from core.latex_normalize import (normalize_latex, unicode_to_latex,
-                                  to_mau_standard, strip_accents_in_math)
+                                  to_mau_standard, strip_accents_in_math,
+                                  unwrap_pseudo_math)
+    from core.importer import split_options_from_text
 
     if settings is None:
         settings = {}
@@ -591,12 +594,15 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
         shade_fill → mã màu nền (hex) áp cho MỌI paragraph của trường này (lời giải).
         """
         correct_subs = correct_subs or set()
-        # Bỏ dấu tiếng Việt TRONG công thức: AIOMT không chuyển được chữ có
-        # dấu, và quy tắc unwrap còn gỡ luôn dấu $ của span có dấu tiếng Việt
-        text = to_mau_standard(normalize_latex(
-            strip_accents_in_math(unicode_to_latex(text or ''))))
+        # Thứ tự BẮT BUỘC: (1) Unicode→LaTeX, gỡ $ bọc nhầm quanh đáp án;
+        # (2) tách đáp án A/B/C/D mỗi cái 1 dòng; (3) bỏ dấu tiếng Việt TRONG công
+        # thức (AIOMT không chuyển được chữ có dấu, unwrap còn gỡ luôn $) rồi chuẩn
+        # hoá theo mẫu — chuẩn hoá chạy theo từng dòng nên phải tách dòng trước,
+        # nếu không "h = 20\nA. 2 s" thành "$h = 20\\text{A}$. 2 s" (A = Ampe).
+        text = unwrap_pseudo_math(unicode_to_latex(text or ''))
         if split_answers:
             text = _format_exam_text(text)   # tách đáp án A/B/C/D, Câu/Bài xuống dòng
+        text = to_mau_standard(normalize_latex(strip_accents_in_math(text)))
         if not text.strip() and lead_para is None:
             return
         _ans_re = re.compile(r'^\s*\*{0,2}[A-Da-d][.)]')
@@ -724,12 +730,16 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
             correct_letter = _correct_mc_letter(q) if show_ans else None
             correct_subs = _correct_subs(q) if show_ans else set()
 
+            # Phương án bị nuốt vào đề (tài liệu nhập trước khi vá) → tách ra
+            # khi xuất, bản cục bộ, không đụng tài liệu đã lưu
+            q_text, q_options = split_options_from_text(q.text, q.options)
+
             p = docx.add_paragraph()
             p.paragraph_format.space_before = Pt(6)   # tách câu, nội dung trong câu sát nhau
             r_num = p.add_run(f'Câu {q.number}. ')
             set_font(r_num, bold=True, size=12)
             # Đáp án có thể nằm inline trong q.text → truyền correct để gạch chân
-            emit_field(q.text, size=12, lead_para=p,
+            emit_field(q_text, size=12, lead_para=p,
                        correct_letter=correct_letter, correct_subs=correct_subs)
 
             # Hình ảnh
@@ -744,7 +754,7 @@ def export_word(doc: Document, output_path: str, show_solutions: bool = True, se
                         pass
 
             # Options — chỉ gạch chân CHỮ CÁI ĐẦU của phương án ĐÚNG (bản đáp án)
-            for opt in q.options:
+            for opt in q_options:
                 po = docx.add_paragraph()
                 po.paragraph_format.left_indent = Cm(0.8)
                 opt_txt = to_mau_standard(normalize_latex(

@@ -456,7 +456,8 @@ function buildQuestionCard(q, secIdx, qIdx) {
   textDiv.textContent = q.text;
   // Focus: restore raw LaTeX để chỉnh sửa; Blur: render lại KaTeX
   textDiv.addEventListener('focus', () => { textDiv.textContent = q.text; saveCaret?.(textDiv); });
-  textDiv.addEventListener('input', () => { q.text = textDiv.textContent; markUnsaved(); });
+  // innerText giữ xuống dòng giữa đề và các phương án (textContent nối dính)
+  textDiv.addEventListener('input', () => { q.text = textDiv.innerText.replace(/\u00a0/g, ' ').replace(/\n+$/, ''); markUnsaved(); });
   textDiv.addEventListener('blur', () => rerenderMath(textDiv));
   // Dán ảnh (Ctrl+V) trực tiếp vào câu hỏi → đăng ký vào q.images để AI đọc được
   textDiv.addEventListener('paste', (e) => {
@@ -495,8 +496,20 @@ function buildQuestionCard(q, secIdx, qIdx) {
   btnToggle.title = 'Ẩn/hiện lời giải';
   btnToggle.addEventListener('click', () => toggleSolution(q, btnToggle, card));
 
+  // Nút tách phương án A/B/C/D đang dính trong đề ra thành danh sách riêng
+  const btnSplit = el('button', 'q-act-btn', '⤴');
+  btnSplit.title = 'Tách phương án A/B/C/D đang nằm trong đề';
+  btnSplit.addEventListener('click', () => {
+    const r = splitOptionsFromText(q.text, q.options);
+    if (!r) { showToast('Không thấy khối A./B./C./D. trong đề (hoặc câu đã có phương án)'); return; }
+    q.text = r.text; q.options = r.options;
+    markUnsaved();
+    renderEditorPanel(state.currentDoc, { preserveUnsaved: true, preserveScroll: true });
+  });
+
   actions.appendChild(btnSolve);
   actions.appendChild(btnImg);
+  actions.appendChild(btnSplit);
   actions.appendChild(btnToggle);
   head.appendChild(num);
   head.appendChild(textDiv);
@@ -530,7 +543,7 @@ function buildQuestionCard(q, secIdx, qIdx) {
       // Text option — editable, bỏ prefix "A. " nếu có để sửa phần nội dung
       const textDiv = el('div', 'q-option-text');
       textDiv.contentEditable = 'true';
-      let rawOpt = o.replace(/^[A-Da-d]\s*[.)]\s*/, '');
+      let rawOpt = o.replace(/^\**\s*\(?([A-Da-d])\)?\**\s*\\?[.):]?\**\s*/, '');
       textDiv.textContent = rawOpt;
       textDiv.addEventListener('focus', () => { textDiv.textContent = rawOpt; });
       textDiv.addEventListener('input', () => {
@@ -1527,6 +1540,22 @@ function zoomImage(src) {
 }
 
 // ── Tiện ích ──────────────────────────────────────────────────────
+// Bản JS của importer.split_options_from_text: khối A./B./C./D. tăng dần trong
+// đề → { text: đề đã cắt, options: [...] }; không tách được → null
+function splitOptionsFromText(text, options) {
+  if ((options && options.length >= 2) || !text) return null;
+  const re = /\**\(?([A-D])\**(?:\)|\s*\\?[.):\-])\**\s*/g;
+  const ms = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index === 0 || /\s/.test(text[m.index - 1])) ms.push({ letter: m[1], start: m.index, body: m.index + m[0].length });
+  }
+  if (ms.length < 2 || ms[0].letter !== 'A') return null;
+  for (let i = 1; i < ms.length; i++) if (ms[i].letter.charCodeAt(0) !== ms[i - 1].letter.charCodeAt(0) + 1) return null;
+  const opts = ms.map((x, i) => x.letter + '. ' + text.slice(x.body, i + 1 < ms.length ? ms[i + 1].start : text.length).trim());
+  return { text: text.slice(0, ms[0].start).trimEnd(), options: opts };
+}
+
 function getLetter(idx) {
   return String.fromCharCode(65 + idx); // 0→A, 1→B, 2→C, 3→D
 }

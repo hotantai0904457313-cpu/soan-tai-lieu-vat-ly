@@ -14,8 +14,11 @@ import unicodedata
 
 # $...$ inline (non-greedy, không chứa $ bên trong)
 MATH_INLINE_RE = re.compile(r'(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)')
-# $$...$$ display
-MATH_DISPLAY_RE = re.compile(r'\$\$(.+?)\$\$', re.DOTALL)
+# $$...$$ display — cho phép nhiều dòng nhưng KHÔNG vắt qua dòng trống hay qua
+# dòng phương án "A. …" (một $$ lẻ ở đề từng ghép cặp với $$ trong phương án
+# rồi gộp cả khối đề + phương án thành 1 dòng)
+MATH_DISPLAY_RE = re.compile(
+    r'\$\$((?:(?!\n[ \t]*\n)(?!\n[ \t]*\**[A-Da-d][.)][ \t]).)+?)\$\$', re.DOTALL)
 
 
 def _strip_markdown_inside(expr: str) -> str:
@@ -183,6 +186,19 @@ def fix_unbalanced_dollars(text: str) -> str:
         return text
     lines = text.split('\n')
     for i, line in enumerate(lines):
+        if line.count('$$') == 1 and line.count('$') == 2:
+            # $$ mồ côi — 2 dấu $ duy nhất của dòng (cặp $$ kia nằm ở dòng khác,
+            # thường là dòng phương án). Đuôi trông như công thức → bọc $…$ inline;
+            # không thì gỡ hẳn. ($a$$b$ — hai span dính nhau — có 4 dấu $, không dính.)
+            k = line.find('$$')
+            head, tail = line[:k], line[k + 2:]
+            opt_like = re.match(r'\s*\**[A-Da-d][.)]\s', tail)
+            if (tail.strip() and len(tail) <= 80 and not opt_like
+                    and not _VN_DIACRITIC.search(tail) and _MATH_SIGNAL_RE.search(tail)):
+                lines[i] = head + '$' + tail.strip() + '$'
+            else:
+                lines[i] = head + tail
+            continue
         prot = line.replace('$$', '\x00\x00')   # che display delimiter
         if prot.count('$') % 2 == 0:
             continue
@@ -547,39 +563,121 @@ _MAU_UNIT_ALT = '|'.join(re.escape(u) for u in
                          sorted(set(_MAU_UNITS), key=len, reverse=True))
 _MAU_UNIT_SET = set(_MAU_UNITS)
 
+# Đơn vị tiếng Việt → ký hiệu (chỉ áp dụng bên trong \text{...} và bên trong
+# $...$). AIOMT không chuyển được chữ có dấu; bỏ dấu suông cho ra \text{lit}
+# (chữ l·i·t nghiêng) nên đổi hẳn sang ký hiệu SI. Thầy chốt 06/09/2026: lít → l.
+_LIT_SYM = 'l'
+_VN_UNIT_MAP = {
+    'lít': _LIT_SYM, 'lit': _LIT_SYM,
+    'phút': 'min', 'phut': 'min',
+    'giây': 's', 'giay': 's',
+    'giờ': 'h', 'gio': 'h',
+}
+_VN_UNIT_WORDS = '|'.join(sorted(_VN_UNIT_MAP, key=len, reverse=True))
+_VN_UNIT_WORD_RE = re.compile(
+    r'(?<![A-Za-zÀ-Ỹà-ỹ])(' + _VN_UNIT_WORDS + r')(?![A-Za-zÀ-Ỹà-ỹ])')
+_TEXT_CMD_RE = re.compile(r'\\text\{([^{}]*)\}')
+# Đơn vị tiếng Việt trần trong math: "2 lít" → "2\text{l}"; "lít/phút" → \text{l}/\text{min}
+_VN_BARE_AFTER_NUM_RE = re.compile(
+    r'([0-9}])[ \t]*(' + _VN_UNIT_WORDS + r')(?![A-Za-zÀ-Ỹà-ỹ])')
+_VN_BARE_RE = re.compile(
+    r'(?<![A-Za-zÀ-Ỹà-ỹ\\{])(' + _VN_UNIT_WORDS + r')(?![A-Za-zÀ-Ỹà-ỹ}])')
+
+
+def normalize_vn_units(text: str) -> str:
+    r"""\text{lít} → \text{l}, \text{lít/phút} → \text{l/min}, \text{km/giờ} → \text{km/h}."""
+    if not text or '\\text{' not in text:
+        return text
+    return _TEXT_CMD_RE.sub(
+        lambda m: '\\text{%s}' % _VN_UNIT_WORD_RE.sub(
+            lambda u: _VN_UNIT_MAP[u.group(1)], m.group(1)),
+        text)
+
+
 # Vùng math (không chứa $ bên trong, không xuống dòng với inline)
 _MAU_SPLIT = re.compile(r'(\$\$[^$]+?\$\$|\$[^$\n]+?\$)')
+# Display math tách riêng để xử lý theo DÒNG phần còn lại
+_MAU_DISPLAY_SPLIT = re.compile(r'(\$\$[^$]*\$\$)')
+
+# MỌI khoảng trắng trong các regex gộp dưới đây là [ \t] — KHÔNG được xuyên \n:
+# phương án "A. 2 s" / "C. 6 s" ở dòng dưới từng bị nuốt thành đơn vị Ampe/Coulomb
+# ($h = 20\text{A}$. 2 s) → nội dung phương án "nhảy lên đề".
 
 # Số đứng trước cụm math "đơn vị^mũ" do unicode_to_latex sinh: 1,0$cm^{2}$ /
 # 1,$0cm^{2}$ (_take_base gộp chữ số vào base) / 10m/$s^{2}$ ('m/' rớt ngoài)
-# → gộp lại 1 span. Nhóm: (số ngoài, có thể dở dang "1,")(đuôi đơn vị ngoài)
-#                          $(số lọt vào trong)(đơn vị)(mũ)$
+# → gộp lại 1 span. Nhóm: (số ngoài)(khoảng trắng)(đuôi đơn vị ngoài)
+#   $(số lọt vào trong)(đơn vị)(mũ)(phần còn lại của span — phải bắt đầu bằng
+#   toán tử hoặc lệnh LaTeX: "0,5 $m^3 \rightarrow \rho$")$
 _MAU_MERGE_EXP = re.compile(
-    r'(\d+(?:[.,]\d+)?[.,]?)?\s*([A-Za-zµμΩ/.]{0,7}?)'
-    r'\$(\d*)([A-Za-zµμΩ/.]+)(\^\{?-?\d+\}?)\$')
+    r'(\d+(?:[.,]\d+)?[.,]?)?([ \t]*)([A-Za-zµμΩ/.]{0,7}?)'
+    r'\$(\d*)([A-Za-zµμΩ/.]+)(\^\{?-?\d+\}?)'
+    r'((?:[ \t]*(?:[=<>≤≥≈]|\\[A-Za-z]+)[^$\n]*)?)\$')
 
 # Sau đơn vị không được dính thêm chữ (kể cả tiếng Việt có dấu: "5 sẽ" ≠ 5 giây)
 _MAU_UNIT_END = r'(?![A-Za-zµμΩÀ-Ỹà-ỹ0-9])'
 
-# Khoa học bị tách: 2,0.$10^{5}$Pa → $2,0.10^{5}\text{Pa}$
+# Khoa học bị tách: 2,0.$10^{5}$Pa → $2,0.10^{5}\text{Pa}$ ;
+# 3,3.$10^{-3} m^{3}$ (unicode_to_latex gộp mũ+đơn vị vào span) → kéo cả đuôi
 _MAU_MERGE_SCI = re.compile(
-    r'(\d+(?:,\d+)?)\s*[.·]\s*\$10(\^\{?-?\d+\}?)\$\s*'
+    r'(\d+(?:,\d+)?)[ \t]*[.·][ \t]*\$10(\^\{?-?\d+\}?)([^$\n]*)\$[ \t]*'
     r'(' + _MAU_UNIT_ALT + r')?' + _MAU_UNIT_END)
 
-# Span kết thúc bằng số/mũ + đơn vị trần theo sau: $1,5.10^{6}$ Hz → kéo vào \text{}
+# Span kết thúc bằng SỐ ĐỨNG RIÊNG hoặc mũ, theo sau là đơn vị trần: $1,5.10^{6}$ Hz
+# → kéo vào \text{}. Span kết thúc bằng biến có chỉ số ($p_1V_1 = p_2V_2$) thì
+# chữ theo sau là văn xuôi ("V là thể tích"), KHÔNG phải đơn vị Volt.
 _MAU_MERGE_TRAIL_UNIT = re.compile(
-    r'\$([^$\n]*[0-9}])\$\s*(' + _MAU_UNIT_ALT + r')' + _MAU_UNIT_END)
+    r'\$([^$\n]*?(?:(?<![A-Za-z_\\])\d+(?:[.,]\d+)?|\^\{?-?\d+\}?))\$[ \t]*'
+    r'(' + _MAU_UNIT_ALT + r')' + _MAU_UNIT_END)
 
 # Biến 1 chữ cái đứng trước span: g = $10\text{m/s}^2$ → $g = 10\text{m/s}^2$
 _MAU_MERGE_VAR = re.compile(
-    r'(?<![A-Za-zÀ-Ỹà-ỹ0-9])([A-Za-z])\s*=\s*\$([^$\n]+)\$')
+    r'(?<![A-Za-zÀ-Ỹà-ỹ0-9])([A-Za-z])[ \t]*=[ \t]*\$([^$\n]+)\$')
 # Span đứng trước " = số + đơn vị": $\lambda$ = 500nm → $\lambda = 500\text{nm}$
 _MAU_MERGE_SPAN_EQ = re.compile(
-    r'\$([^$\n]+)\$\s*=\s*(\d+(?:[.,]\d+)?)\s*(' + _MAU_UNIT_ALT + r')' + _MAU_UNIT_END)
+    r'\$([^$\n]+)\$[ \t]*=[ \t]*(\d+(?:[.,]\d+)?)[ \t]*(' + _MAU_UNIT_ALT + r')' + _MAU_UNIT_END)
 # Biến 1 chữ cái + " = số + đơn vị" thuần text: c = 0,460kJ/kg.K → $c = 0,460\text{kJ/kg.K}$
 _MAU_VAR_EQ_UNIT = re.compile(
-    r'(?<![A-Za-zÀ-Ỹà-ỹ0-9])([A-Za-z])\s*=\s*(\d+(?:[.,]\d+)?)\s*'
+    r'(?<![A-Za-zÀ-Ỹà-ỹ0-9])([A-Za-z])[ \t]*=[ \t]*(\d+(?:[.,]\d+)?)[ \t]*'
     r'(' + _MAU_UNIT_ALT + r')' + _MAU_UNIT_END)
+
+# Chữ đơn vừa là đơn vị (Ampe, Coulomb, Volt, Tesla…) vừa là chữ phương án A–D
+# hoặc tên biến (V thể tích, T chu kỳ, A biên độ…).
+_MAU_AMBIG = set('ACVFTNJWKHLSM')
+_OPT_AFTER_RE = re.compile(r'[.)][ \t]')
+_OPT_LATER_RE = re.compile(r'(?:^|\s)\**[B-D][.)][ \t]')
+# Chữ đang được dùng làm BIẾN trong biểu thức: V_1, V', V = …, \Delta V
+# (KHÔNG tính V^2 — "m^3" là đơn vị mét khối chứ không phải biến m mũ 3).
+# Chỉ chặn với chữ HOA (V thể tích/Volt, T chu kỳ/Tesla, A biên độ/Ampe…);
+# chữ thường m, s, g, h, l sau chữ số luôn là đơn vị (mét, giây, gam…).
+_VAR_LETTER_RE = re.compile(
+    r"(?<![A-Za-z\\])([A-Z])(?=[_']|[ \t]*=)|\\[Dd]elta[ \t]*([A-Z])")
+# $A$ = $B$ → $A = B$ (hai vế cùng một phương trình bị tách 2 span)
+_MAU_MERGE_SPAN_SPAN = re.compile(r'\$([^$\n]+)\$[ \t]*=[ \t]*\$([^$\n]+)\$')
+# Hai span DÍNH nhau $10^5$$\text{N/m}^2$ (display đã tách riêng trước đó nên
+# $$ giữa dòng chỉ có thể là 2 span inline kề nhau) → gộp 1 span
+_MAU_MERGE_ADJ = re.compile(r'\$([^$\n]+)\$\$([^$\n]+)\$')
+
+
+def _merge_adj(m):
+    a, b = m.group(1), m.group(2)
+    glue = '' if (b.startswith('\\text{') and re.search(r'[\d}]$', a)) else ' '
+    return '$%s%s%s$' % (a, glue, b)
+
+
+def _ambig_ok(unit: str, s: str, end: int) -> bool:
+    """False khi 'đơn vị' 1 chữ A–D thực ra là chữ phương án của dòng chưa tách
+    ("h = 20 A. 2 s B. 4 s")."""
+    if unit not in _MAU_AMBIG:
+        return True
+    if unit in 'ABCD' and _OPT_AFTER_RE.match(s, end) and _OPT_LATER_RE.search(s, end):
+        return False
+    return True
+
+
+def _norm_exp(exp: str) -> str:
+    """Mũ theo mẫu: ^{2}→2 (dương 1 chữ số bỏ ngoặc); -3 / {-3} / 12 → {-3} / {12}."""
+    e = exp.strip('{}')
+    return e if re.fullmatch(r'\d', e) else '{%s}' % e
 
 
 def _mau_fix_math_expr(expr: str) -> str:
@@ -594,90 +692,165 @@ def _mau_fix_math_expr(expr: str) -> str:
         lambda m: r'^\circ\text{%s}' % (m.group(1) or m.group(2)), expr)
     expr = re.sub(r'°\s*([CFK])(?![A-Za-z])', r'^\\circ\\text{\1}', expr)
     expr = expr.replace('°', r'^\circ')
+    # Đơn vị tiếng Việt: \text{lít}→\text{l}; "2 lít"→2\text{l}; "lít/phút"→\text{l/min}
+    expr = normalize_vn_units(expr)
+    expr = _VN_BARE_AFTER_NUM_RE.sub(
+        lambda m: '%s\\text{%s}' % (m.group(1), _VN_UNIT_MAP[m.group(2)]), expr)
+    expr = _VN_BARE_RE.sub(lambda m: '\\text{%s}' % _VN_UNIT_MAP[m.group(1)], expr)
+    expr = re.sub(r'\\text\{([^{}]+)\}/\\text\{([^{}]+)\}', r'\\text{\1/\2}', expr)
     # Đơn vị trần sau chữ số (hoặc sau ^{n}) → \text{...}
     # Lookahead chặn } (tránh re-wrap chữ cuối trong \text{...} sẵn có)
     # và chặn _ (biến có chỉ số dưới V_{2}, p_{1}... KHÔNG phải đơn vị Volt;
-    # vẫn cho ^ vì đơn vị mang mũ m^{2}, cm^{3} phải được bọc)
+    # vẫn cho ^ vì đơn vị mang mũ m^{2}, cm^{3} phải được bọc).
+    # Chữ đơn đang là BIẾN trong cùng biểu thức (V' = 2V, \Delta V = 2V) thì
+    # KHÔNG phải đơn vị.
+    var_letters = {a or b for a, b in _VAR_LETTER_RE.findall(expr)}
+
+    def _wrap_unit(m):
+        unit = m.group(2)
+        if len(unit) == 1 and unit in var_letters:
+            return m.group(0)
+        if not _ambig_ok(unit, m.string, m.end()):
+            return m.group(0)
+        return '%s\\text{%s}' % (m.group(1), unit)
     expr = re.sub(
         r'([0-9}])\s*(' + _MAU_UNIT_ALT + r')(?![A-Za-zµμΩÀ-Ỹà-ỹ}_])',
-        r'\1\\text{\2}', expr)
+        _wrap_unit, expr)
     # Mũ 1 chữ số bỏ ngoặc cho khớp mẫu: ^{2} → ^2 (giữ ^{-3}, ^{10})
     expr = re.sub(r'\^\{([0-9])\}', r'^\1', expr)
     return expr
+
+
+# Lưới an toàn cuối cho đoạn NGOÀI math: lệnh LaTeX trần (\text{m}^3, \frac{a}{b})
+# còn sót → bọc $ (kèm số đứng ngay trước). Word không được nhận LaTeX trần.
+_RAW_LATEX_RE = re.compile(
+    r'(\d+(?:[.,]\d+)?)?([ \t]*)'
+    r'(\\(?:text|frac|sqrt|vec|mathrm)\{[^{}\n]*\}(?:\{[^{}\n]*\})?(?:\^\{?-?\d+\}?)?)')
+# Tiền tố "V = " tuỳ chọn cho các luật khoa học ở đoạn ngoài math
+_MAU_VAR_PREFIX = r'(?:(?<![A-Za-zÀ-Ỹà-ỹ0-9])([A-Za-z])[ \t]*=[ \t]*)?'
+_MAU_UNIT_EXP = r'(?:(' + _MAU_UNIT_ALT + r')(\^\{?-?\d+\}?)?)?' + _MAU_UNIT_END
+
+
+def _sub_outside_math(pattern, repl, seg: str) -> str:
+    """re.sub CHỈ trên phần ngoài $...$ — các luật ở _mau_fix_plain sinh span mới,
+    luật sau không được đụng vào span luật trước vừa tạo (từng bọc $ chồng $)."""
+    out = []
+    for part in _MAU_SPLIT.split(seg):
+        if not part:
+            continue
+        if part.startswith('$') and part.endswith('$') and len(part) > 2:
+            out.append(part)
+        else:
+            out.append(re.sub(pattern, repl, part))
+    return ''.join(out)
 
 
 def _mau_fix_plain(seg: str) -> str:
     """Xử lý đoạn NGOÀI math: chỉ bọc $ khi có cấu trúc toán (độ, khoa học,
     phương trình var=số+đơn vị) — số+đơn vị đơn giản giữ text thường theo mẫu."""
     # 25°C → $25^\circ\text{C}$
-    seg = re.sub(r'(\d+(?:[.,]\d+)?)\s*°\s*([CFK])(?![A-Za-zÀ-Ỹà-ỹ])',
-                 r'$\1^\\circ\\text{\2}$', seg)
+    seg = _sub_outside_math(r'(\d+(?:[.,]\d+)?)\s*°\s*([CFK])(?![A-Za-zÀ-Ỹà-ỹ])',
+                            r'$\1^\\circ\\text{\2}$', seg)
     # Góc 45° → $45^\circ$
-    seg = re.sub(r'(\d+(?:[.,]\d+)?)\s*°(?!\s*[CFK])', r'$\1^\\circ$', seg)
+    seg = _sub_outside_math(r'(\d+(?:[.,]\d+)?)\s*°(?!\s*[CFK])', r'$\1^\\circ$', seg)
 
-    # Khoa học ASCII: 2,0.10^5 Pa / 3.10^-6 → $2,0.10^5\text{Pa}$
+    def _unit_tail(unit, uexp):
+        if not unit:
+            return ''
+        out = r'\text{%s}' % unit
+        if uexp:
+            out += '^' + _norm_exp(uexp[1:])
+        return out
+
+    # Khoa học ASCII: V = 3,3.10^{-3} m^3 / 2,0.10^5 Pa / 3.10^-6
+    # → $V = 3,3.10^{-3}\text{m}^3$ (mũ đơn vị đi CÙNG span, mũ âm giữ ngoặc)
     def _sci(m):
-        num, exp, unit = m.group(1), m.group(2), m.group(3)
-        exp = re.sub(r'^\{(-?\d)\}$', r'\1', exp)  # bỏ ngoặc mũ 1 ký tự
-        out = '$%s.10^%s' % (num, exp)
-        if unit:
-            out += r'\text{%s}' % unit
-        return out + '$'
-    seg = re.sub(
-        r'(\d+(?:,\d+)?)\s*[.·×]\s*10\^(\{?-?\d+\}?)\s*'
-        r'(' + _MAU_UNIT_ALT + r')?' + _MAU_UNIT_END, _sci, seg)
+        var, num, exp, unit, uexp = m.groups()
+        out = '$' + ('%s = ' % var if var else '')
+        out += '%s.10^%s' % (num, _norm_exp(exp))
+        return out + _unit_tail(unit, uexp) + '$'
+    seg = _sub_outside_math(
+        _MAU_VAR_PREFIX + r'(\d+(?:,\d+)?)[ \t]*[.·×][ \t]*10\^(\{?-?\d+\}?)[ \t]*'
+        + _MAU_UNIT_EXP, _sci, seg)
+
+    # Luỹ thừa 10 không có phần định trị: V = 10^{-3} m^3 → $V = 10^{-3}\text{m}^3$
+    def _pow(m):
+        var, exp, unit, uexp = m.groups()
+        out = '$' + ('%s = ' % var if var else '') + '10^' + _norm_exp(exp)
+        return out + _unit_tail(unit, uexp) + '$'
+    seg = _sub_outside_math(
+        _MAU_VAR_PREFIX + r'(?<![\d,.^{])10\^(\{?-?\d+\}?)[ \t]*' + _MAU_UNIT_EXP,
+        _pow, seg)
 
     # c = 0,460kJ/kg.K (thuần text, không có gì kích hoạt math) → bọc chuẩn mẫu
-    seg = _MAU_VAR_EQ_UNIT.sub(r'$\1 = \2\\text{\3}$', seg)
+    def _var_eq_unit(m):
+        if not _ambig_ok(m.group(3), m.string, m.end()):
+            return m.group(0)
+        return '$%s = %s\\text{%s}$' % m.groups()
+    seg = _sub_outside_math(_MAU_VAR_EQ_UNIT, _var_eq_unit, seg)
+
+    # Lưới an toàn: LaTeX trần còn sót ngoài $ → bọc lại
+    seg = _sub_outside_math(
+        _RAW_LATEX_RE,
+        lambda m: '%s$%s%s$' % ('' if m.group(1) else m.group(2),
+                               m.group(1) or '', m.group(3)), seg)
     return seg
 
 
-def to_mau_standard(text: str) -> str:
-    r"""
-    Đưa văn bản (đã qua unicode_to_latex + normalize_latex) về chuẩn file mẫu:
-      1,0$cm^{2}$        → $1,0\text{cm}^2$
-      2,0.$10^{5}$Pa     → $2,0.10^5\text{Pa}$
-      g = $10\text{m/s}^2$ → $g = 10\text{m/s}^2$   (kéo biến vào span)
-      25°C (text thường)  → $25^\circ\text{C}$
-      $v = 5 m/s$        → $v = 5\text{m/s}$
-    CHỈ dùng cho đường xuất Word (AIOMT).
-    """
+def _merge_exp(m):
+    num_out, ws, pre, num_in, base, exp, tail = m.groups()
+    unit = (pre or '') + base
+    num = (num_out or '') + (num_in or '')
+    # số ngoài kết thúc bằng . , thì phần số trong phải nối tiếp (vd "1," + "0")
+    if num and num[-1] in '.,' and not num_in:
+        return m.group(0)
+    if unit in _MAU_UNIT_SET:
+        # Không gộp số/đuôi nào → giữ khoảng trắng đứng trước ("sang $m^3$")
+        lead = ws if not (num_out or pre) else ''
+        return '%s$%s\\text{%s}%s%s$' % (lead, num, unit, exp, tail or '')
+    return m.group(0)
+
+
+def _merge_sci(m):
+    num, exp, tail, unit = m.groups()
+    if unit and not _ambig_ok(unit, m.string, m.end()):
+        return m.group(0)
+    out = '$%s.10%s%s' % (num, exp, tail or '')
+    if unit:
+        out += r'\text{%s}' % unit
+    return out + '$'
+
+
+def _merge_trail(m):
+    if not _ambig_ok(m.group(2), m.string, m.end()):
+        return m.group(0)
+    return '$%s\\text{%s}$' % (m.group(1), m.group(2))
+
+
+def _merge_span_eq(m):
+    if not _ambig_ok(m.group(3), m.string, m.end()):
+        return m.group(0)
+    return '$%s = %s\\text{%s}$' % (m.group(1).strip(), m.group(2), m.group(3))
+
+
+def _merge_pass(text: str) -> str:
+    """Các bước gộp span (1–3). Chạy trước VÀ sau bước chuẩn hoá từng vùng,
+    vì bước 4 có thể sinh span mới cần kéo biến vào (V = $10^{-3}\\text{m}^3$)."""
+    text = _MAU_MERGE_EXP.sub(_merge_exp, text)                     # 1
+    text = _MAU_MERGE_SCI.sub(_merge_sci, text)                     # 2
+    text = _MAU_MERGE_TRAIL_UNIT.sub(_merge_trail, text)            # 2b
+    text = _MAU_MERGE_VAR.sub(lambda m: '$%s = %s$' % (m.group(1), m.group(2)), text)  # 3
+    text = _MAU_MERGE_SPAN_EQ.sub(_merge_span_eq, text)
+    text = _MAU_MERGE_SPAN_SPAN.sub(r'$\1 = \2$', text)
+    text = _MAU_MERGE_ADJ.sub(_merge_adj, text)
+    return text
+
+
+def _to_mau_line(text: str) -> str:
+    """to_mau_standard cho MỘT dòng (không chứa \\n, không chứa $$ display)."""
     if not text:
         return text
-
-    # 1) Gộp số + cụm math đơn-vị-mũ thành 1 span
-    def _merge_exp(m):
-        num_out, pre, num_in, base, exp = m.groups()
-        unit = (pre or '') + base
-        num = (num_out or '') + (num_in or '')
-        # số ngoài kết thúc bằng . , thì phần số trong phải nối tiếp (vd "1," + "0")
-        if num and num[-1] in '.,' and not num_in:
-            return m.group(0)
-        if unit in _MAU_UNIT_SET:
-            return '$%s\\text{%s}%s$' % (num, unit, exp)
-        return m.group(0)
-    text = _MAU_MERGE_EXP.sub(_merge_exp, text)
-
-    # 2) Gộp ký hiệu khoa học bị tách + đơn vị theo sau
-    def _merge_sci(m):
-        num, exp, unit = m.groups()
-        out = '$%s.10%s' % (num, exp)
-        if unit:
-            out += r'\text{%s}' % unit
-        return out + '$'
-    text = _MAU_MERGE_SCI.sub(_merge_sci, text)
-
-    # 2b) Span kết thúc bằng số/mũ + đơn vị trần theo sau → kéo đơn vị vào span
-    text = _MAU_MERGE_TRAIL_UNIT.sub(
-        lambda m: '$%s\\text{%s}$' % (m.group(1), m.group(2)), text)
-
-    # 3) Kéo biến/span vào phương trình
-    text = _MAU_MERGE_VAR.sub(lambda m: '$%s = %s$' % (m.group(1), m.group(2)), text)
-    text = _MAU_MERGE_SPAN_EQ.sub(
-        lambda m: '$%s = %s\\text{%s}$' % (m.group(1).strip(), m.group(2), m.group(3)),
-        text)
-
-    # 4) Chuẩn hoá từng vùng
+    text = _merge_pass(text)
     out = []
     for part in _MAU_SPLIT.split(text):
         if not part:
@@ -688,7 +861,35 @@ def to_mau_standard(text: str) -> str:
             out.append('$' + _mau_fix_math_expr(part[1:-1]) + '$')
         else:
             out.append(_mau_fix_plain(part))
+    return _merge_pass(''.join(out))
+
+
+def to_mau_standard(text: str) -> str:
+    r"""
+    Đưa văn bản (đã qua unicode_to_latex + normalize_latex) về chuẩn file mẫu:
+      1,0$cm^{2}$        → $1,0\text{cm}^2$
+      2,0.$10^{5}$Pa     → $2,0.10^5\text{Pa}$
+      g = $10\text{m/s}^2$ → $g = 10\text{m/s}^2$   (kéo biến vào span)
+      25°C (text thường)  → $25^\circ\text{C}$
+      $v = 5 m/s$        → $v = 5\text{m/s}$
+      $2\text{lít}$      → $2\text{l}$
+    Xử lý THEO TỪNG DÒNG (display $$…$$ nhiều dòng giữ nguyên khối) — regex gộp
+    không được phép nuốt chữ phương án ở dòng dưới. Idempotent.
+    CHỈ dùng cho đường xuất Word (AIOMT).
+    """
+    if not text:
+        return text
+    text = normalize_vn_units(text)
+    out = []
+    for chunk in _MAU_DISPLAY_SPLIT.split(text):
+        if not chunk:
+            continue
+        if chunk.startswith('$$') and chunk.endswith('$$') and len(chunk) > 4:
+            out.append('$$' + _mau_fix_math_expr(chunk[2:-2]) + '$$')
+        else:
+            out.append('\n'.join(_to_mau_line(line) for line in chunk.split('\n')))
     return ''.join(out)
+
 
 
 # ── LaTeX → chữ Unicode đọc được (cho đường xuất PDF) ────────────────
@@ -855,7 +1056,9 @@ def plain_if_latex(text: str) -> str:
 # CHỈ đụng phần trong $...$ — văn xuôi ngoài công thức giữ nguyên dấu tiếng Việt.
 
 # Dấu hiệu "đây là công thức thật": có lệnh LaTeX, chỉ số/số mũ, hoặc phép tính
-_MATH_SIGNAL_RE = re.compile(r'\[A-Za-z]+|[_^]|=\s*[-\d.,]|\d\s*[+\-*/]\s*\d')
+# (lệnh LaTeX là r'\\[A-Za-z]+' — từng thiếu 1 dấu \ nên \text{lít} không được coi
+#  là công thức → không bỏ dấu → unwrap_pseudo_math gỡ luôn $ → LaTeX thô trong Word)
+_MATH_SIGNAL_RE = re.compile(r'\\[A-Za-z]+|[_^]|=\s*[-\d.,]|\d\s*[+\-*/]\s*\d')
 
 
 def _deaccent_vn(s: str) -> str:
@@ -891,7 +1094,9 @@ def strip_accents_in_math(text: str, max_vn_words: int = 3) -> str:
         vn_words = sum(1 for w in inner.split() if _VN_DIACRITIC.search(w))
         if vn_words > max_vn_words:
             return whole            # cả câu tiếng Việt → để nguyên cho unwrap
-        return whole.replace(inner, _deaccent_vn(inner))
+        # Đơn vị tiếng Việt trong \text{} đổi sang ký hiệu (lít→l, phút→min)
+        # TRƯỚC khi bỏ dấu — tránh ra \text{lit} (chữ l·i·t nghiêng vô nghĩa)
+        return whole.replace(inner, _deaccent_vn(normalize_vn_units(inner)))
 
     text = re.sub(r'\$\$(.+?)\$\$', _fix, text, flags=re.DOTALL)
     text = re.sub(r'\$([^$\n]+?)\$', _fix, text)

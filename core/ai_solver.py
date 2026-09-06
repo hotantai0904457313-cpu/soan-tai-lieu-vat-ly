@@ -43,6 +43,8 @@ QUY TẮC CÔNG THỨC (BẮT BUỘC):
 - KÝ HIỆU KHOA HỌC: $2,0.10^5\\text{Pa}$ — dấu CHẤM nhân trước 10, KHÔNG dùng \\cdot hay \\times.
 - Số thập phân dùng dấu PHẨY trần: $0,460$ (KHÔNG viết $0{,}460$).
 - Số + đơn vị ĐƠN GIẢN (không mũ, không phân số) để text thường: 1,5J, 20N, 30 m — KHÔNG bọc $.
+- THỂ TÍCH và mọi đơn vị có mũ LUÔN bọc $ với \\text{}: $V = 3,3.10^{-3}\\text{m}^3$, $20\\text{cm}^3$,
+  $5\\text{dm}^3$, $\\rho = 4\\text{kg/m}^3$. Lít viết $V = 2\\text{l}$ — KHÔNG viết chữ "lít" trong $...$.
 - TUYỆT ĐỐI KHÔNG dùng $$...$$ (chỉ $...$). Chữ thường KHÔNG bọc trong $."""
 
 
