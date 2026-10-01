@@ -1123,6 +1123,10 @@ _GEMINI_PROMPT = (
 #     hay lệch, mà placeholder không cắt được thì mất nguyên bảng
 #   - nén vi-quy-tắc LaTeX lại cho gọn để model dồn sức vào việc đọc đủ
 #   - bắt buộc anchor_text để neo hình: trang scan không có lớp text để so khớp
+#   - toạ độ hình dạng box_2d [ymin, xmin, ymax, xmax] thang 0–1000 — định dạng
+#     GỐC của Gemini. Ép dùng % thì Gemini 3.x hay "trượt" về thang 0–1000, lẫn
+#     cả hai trong một khung → 31/33 hình của 1 đề scan 20 trang không cắt được
+#     (đo 01/10/2026). Đọc lại toạ độ: _fig_bbox_pct.
 _SCAN_PROMPT = (
     "Đây là ẢNH CHỤP/BẢN SCAN một trang sách hoặc đề thi Vật lí THPT Việt Nam.\n"
     "Chữ có thể mờ, lệch, dính nhau.\n\n"
@@ -1133,7 +1137,7 @@ _SCAN_PROMPT = (
     "{\n"
     '  "markdown": "...",\n'
     '  "figures": [\n'
-    '    {"id": 1, "bbox": [x1_pct, y1_pct, x2_pct, y2_pct], '
+    '    {"id": 1, "box_2d": [ymin, xmin, ymax, xmax], '
     '"anchor_text": "...", "caption": "..."}\n'
     "  ]\n"
     "}\n\n"
@@ -1166,7 +1170,9 @@ _SCAN_PROMPT = (
     "HÌNH VẼ\n"
     "13. Mỗi hình vẽ / đồ thị / sơ đồ mạch → đặt {{FIGURE_1}}, {{FIGURE_2}}... đúng "
     "chỗ trong markdown và khai trong \"figures\".\n"
-    "14. bbox: [left%, top%, right%, bottom%] theo % chiều rộng/cao trang (0.0–100.0).\n"
+    "14. box_2d: [ymin, xmin, ymax, xmax] — toạ độ CHUẨN HOÁ 0–1000 theo ảnh "
+    "(0 = mép trên/mép trái, 1000 = mép dưới/mép phải; y TRƯỚC, x SAU). Khung bao "
+    "TRỌN hình, kể cả nhãn chữ trên hình (A, B, I₁, (1)…).\n"
     "15. anchor_text = NGUYÊN VĂN 6–12 từ đầu của dòng chữ ngay TRÊN (hoặc bên cạnh) "
     "hình đó — dùng để đặt hình vào đúng chỗ. BẮT BUỘC có.\n"
     "16. KHÔNG khai: bảng số liệu, công thức rời, logo, số trang, watermark, ô kẻ "
@@ -1342,17 +1348,78 @@ def _vision_call(model: str, img_bytes: bytes, prompt: str,
     raise last if last else RuntimeError("Vision call lỗi không rõ")
 
 
+def _axis_pct(a: float, c: float):
+    """Một trục (đầu, cuối) của bbox Gemini → (đầu, cuối) theo %, hoặc None.
+
+    Gemini 3.x được dặn trả % (0–100) nhưng hay trả thang 0–1000 (định dạng
+    box_2d nó quen), có khi lẫn cả hai TRONG CÙNG một trục: [655, …, 94, …] =
+    65,5% → 94%. Số > 100 chắc chắn là phần nghìn; số ≤ 100 thì ưu tiên CÙNG đơn
+    vị với đầu kia của trục, khung vô lí (đầu ≥ cuối) mới thử đơn vị còn lại.
+    Đo trên đề scan thật: [74, 99, 90, 186] ↔ PDF x 71–89%, y 10–18%;
+    [76, 198, 882, 298] ↔ x 9–88%, y 20–30%."""
+    if a < 0 or c < 0:
+        return None
+    if a <= 100 and c <= 100:
+        order = [(a, c)]
+    elif a > 100 and c > 100:
+        order = [(a / 10, c / 10)]
+    elif c > 100:
+        order = [(a / 10, c / 10), (a, c / 10)]
+    else:
+        order = [(a / 10, c / 10), (a / 10, c)]
+    for lo, hi in order:
+        if hi <= 100.5 and hi - lo >= 0.5:
+            return lo, min(hi, 100.0)
+    return None
+
+
+def _fig_bbox_pct(fig: dict) -> list:
+    """Khung hình Gemini khai → [x0, y0, x1, y1] theo % ảnh, [] nếu vô lí.
+    Nhận cả box_2d [ymin, xmin, ymax, xmax] thang 0–1000 (prompt trang scan) lẫn
+    bbox [x0, y0, x1, y1] theo % (prompt trang digital — đơn vị tự nhận qua
+    _axis_pct vì model hay lẫn)."""
+    b2 = fig.get("box_2d")
+    if isinstance(b2, (list, tuple)) and len(b2) == 4:
+        try:
+            ymin, xmin, ymax, xmax = (float(v) for v in b2)
+        except (TypeError, ValueError):
+            return []
+        if min(ymin, xmin) < 0 or max(ymax, xmax) > 1005:
+            return []
+        out = [xmin / 10, ymin / 10, min(xmax / 10, 100.0), min(ymax / 10, 100.0)]
+        return out if out[2] - out[0] >= 0.5 and out[3] - out[1] >= 0.5 else []
+    b = fig.get("bbox")
+    if not isinstance(b, (list, tuple)) or len(b) != 4:
+        return []
+    try:
+        x0, y0, x1, y1 = (float(v) for v in b)
+    except (TypeError, ValueError):
+        return []
+    xa, ya = _axis_pct(x0, x1), _axis_pct(y0, y1)
+    if not xa or not ya:
+        return []
+    return [xa[0], ya[0], xa[1], ya[1]]
+
+
 def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
                      fig_dir: Path, model: str = "ag/gemini-3.7-flash-low",
                      niner_url: str = "", niner_key: str = "",
                      gemini_api_key: str = "", scan: bool = False,
-                     prompt_extra: str = "") -> str:
+                     prompt_extra: str = "", part: int = 0,
+                     y_off: float = 0.0, y_span: float = 1.0,
+                     dpi: int = 144) -> str:
     """Xử lý 1 trang qua Vision (9Router hoặc Gemini trực tiếp) → markdown
     (đã cắt figures/bảng theo bbox). THUẦN (không fitz) → an toàn đa luồng.
 
     scan=True → dùng _SCAN_PROMPT (bản scan: đọc đủ, giữ số in trên trang, bảng
     thành Markdown) thay vì _GEMINI_PROMPT (trang digital phức tạp).
     prompt_extra → thêm vào đầu prompt (dùng khi chỉ gửi một nửa trang).
+    part > 0 → ảnh là NỬA THỨ part của trang (đọc lại theo nửa): id hình cộng
+      100·part để 2 nửa không ghi đè file của nhau; bbox quy đổi về % CẢ TRANG
+      nhờ y_off/y_span (nửa ảnh phủ dải [y_off, y_off+y_span] của trang); json
+      ghi riêng p{N}_gemini_boxes_h{part}.json.
+    dpi → DPI thật của ảnh render (zoom 2 = 144, zoom 3 = 216) ghi vào PNG để
+      Pandoc dựng đúng cỡ gốc. Kích thước cắt lấy từ ẢNH THẬT, không tin page_w/h.
     """
     import json as _json
     import re as _re
@@ -1423,11 +1490,35 @@ def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
         for _suf in _sufs:
             md_text = md_text.replace(_ctrl + _suf, '\\' + _CTRL2ESC[_ctrl] + _suf)
 
-    placed_boxes = []   # bbox (%) các hình ĐÃ chèn — để pdf_word_figures không cắt trùng
+    if _pil_ok:
+        try:
+            with PILImage.open(_io.BytesIO(img_bytes)) as _im:
+                page_w, page_h = _im.size
+        except Exception:
+            pass
+
+    # Mọi hình Gemini khai (kể cả hình không cắt được) — bbox quy về % CẢ TRANG.
+    # pdf_word_figures dùng: (1) chống trùng với hình xác định, (2) trang scan
+    # cắt lại hình từ trang PDF ở DPI cao, (3) anchor_text/caption để neo hình.
+    all_boxes = []
     for fig in figures:
         local_id = fig.get("id")
+        gid = local_id
+        if part:
+            try:
+                gid = 100 * part + int(local_id)
+            except Exception:
+                gid = f"{part}_{local_id}"
+        bbox = _fig_bbox_pct(fig)
+        entry = {"id": gid,
+                 "bbox": ([bbox[0], y_off * 100 + bbox[1] * y_span,
+                           bbox[2], y_off * 100 + bbox[3] * y_span]
+                          if len(bbox) == 4 else []),
+                 "placed": False,
+                 "caption": (fig.get("caption") or "").strip(),
+                 "anchor_text": (fig.get("anchor_text") or "").strip()}
+        all_boxes.append(entry)
         try:
-            bbox = fig.get("bbox", [])
             if len(bbox) == 4 and _pil_ok:
                 x1 = max(0, int(bbox[0] / 100 * page_w))
                 y1 = max(0, int(bbox[1] / 100 * page_h))
@@ -1437,20 +1528,21 @@ def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
                 if (x2 - x1) > 30 and (y2 - y1) > 30 and placeholder in md_text:
                     img = PILImage.open(_io.BytesIO(img_bytes))
                     crop = img.crop((x1, y1, x2, y2))
-                    fig_name = f"p{idx+1}_fig{local_id}.png"
-                    # Trang render zoom 2 → 144 DPI: ghi vào PNG để Pandoc dựng đúng
-                    # cỡ gốc (không ghi → Pandoc coi 96 DPI → hình to gấp 1,5 lần)
-                    crop.save(fig_dir / fig_name, "PNG", dpi=(144, 144))
+                    fig_name = f"p{idx+1}_fig{gid}.png"
+                    # Ghi DPI thật vào PNG để Pandoc dựng đúng cỡ gốc (không ghi →
+                    # Pandoc coi 96 DPI → hình to gấp 1,5–2,25 lần)
+                    crop.save(fig_dir / fig_name, "PNG", dpi=(dpi, dpi))
                     caption = fig.get("caption", f"Hình {local_id}")
                     md_text = md_text.replace(
                         placeholder,
                         f"\n\n![{caption}](figures/{fig_name})\n\n")
-                    placed_boxes.append({"id": local_id, "bbox": [float(v) for v in bbox]})
+                    entry["placed"] = True
         except Exception:
             pass
     try:
-        (fig_dir / f"p{idx+1}_gemini_boxes.json").write_text(
-            _json.dumps(placed_boxes), encoding="utf-8")
+        suffix = f"_h{part}" if part else ""
+        (fig_dir / f"p{idx+1}_gemini_boxes{suffix}.json").write_text(
+            _json.dumps(all_boxes, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
 
@@ -1499,6 +1591,143 @@ def _png_halves(img_bytes: bytes, overlap: float = 0.15) -> list:
             return out
     except Exception:
         return []
+
+
+_HALF_OVERLAP = 0.15
+# Dải Y (tỉ lệ trang) mà mỗi nửa của _png_halves phủ — khớp cách cắt ở trên
+_HALF_SPANS = ((0.0, 0.5 + _HALF_OVERLAP), (0.5 - _HALF_OVERLAP, 1.0))
+
+
+def _read_page_halves(idx: int, img_bytes: bytes, page_w: int, fig_dir: Path,
+                      is_scan: bool, model: str, niner_url: str = "",
+                      niner_key: str = "", gemini_api_key: str = "",
+                      dpi: int = 144) -> str:
+    """Trang bị cắt giữa đường → đọc lại theo 2 nửa chồng lấn rồi nối.
+    Mỗi nửa ghi hình/json riêng (part=1,2) nên không ghi đè lẫn nhau."""
+    halves = _png_halves(img_bytes, overlap=_HALF_OVERLAP)
+    if not halves:
+        return ""
+    parts = {}
+    for k, (hb, (y0, y1)) in enumerate(zip(halves, _HALF_SPANS), 1):
+        try:
+            parts[k] = _gemini_one_page(
+                hb, page_w, 0, idx, fig_dir, model=model,
+                niner_url=niner_url, niner_key=niner_key,
+                gemini_api_key=gemini_api_key, scan=is_scan,
+                prompt_extra=_SCAN_STRIP_HINT, part=k,
+                y_off=y0, y_span=y1 - y0, dpi=dpi)
+        except Exception:
+            continue
+    top, bottom = parts.get(1, ""), parts.get(2, "")
+    if top and bottom:
+        bottom = _drop_dup_half_figures(bottom, fig_dir, idx)
+        bottom = _drop_overlap_lines(top, bottom)
+    return "\n\n".join(p for p in (top, bottom) if p).strip()
+
+
+def _norm_line(s: str) -> str:
+    """Chỉ giữ chữ + số, chữ thường — so khớp dòng giữa 2 lần đọc (OCR mỗi lần
+    có thể khác dấu câu, khoảng trắng, định dạng **…**)."""
+    import re as _re
+    return _re.sub(r'[\W_]+', '', (s or '').lower())
+
+
+def _drop_overlap_lines(top: str, bottom: str) -> str:
+    """Hai nửa trang chồng lấn 30% chiều cao → các dòng trong dải chồng lấn được
+    đọc Ở CẢ HAI nửa. Bỏ khỏi đầu nửa dưới những dòng đã có ở cuối nửa trên.
+
+    Chỉ xét dòng "có nghĩa" (≥ 12 chữ/số) giống ≥ 85% → dòng phương án ngắn
+    ("**A.** 2 cm") lặp thật giữa các câu không bao giờ bị xoá. Dòng ngắn chỉ bị
+    xoá khi giống HỆT một dòng ở cuối nửa trên VÀ nằm liền kề dòng đã bị xoá
+    (vd "- Kí hiệu: $\\vec{B}$." nằm giữa 2 dòng lặp)."""
+    from difflib import SequenceMatcher
+    a = top.split("\n")
+    b = bottom.split("\n")
+    a_tail = [_norm_line(s) for s in a[int(len(a) * 0.4):]]
+    a_long = [x for x in a_tail if len(x) >= 12]
+    a_set = set(x for x in a_tail if x)
+    lim = min(len(b), max(4, int(len(b) * 0.6)))   # dải chồng lấn ≈ 46% đầu nửa dưới
+    drop = set()
+    a_heads = set(_norm_line(x) for x in a[int(len(a) * 0.4):] if x.lstrip().startswith("#"))
+    for i in range(lim):
+        n = _norm_line(b[i])
+        # Tiêu đề lặp (hai lần đọc hay ghi khác cấp: "### 2. Cảm ứng từ" / "## 2. …")
+        if n and b[i].lstrip().startswith("#") and n in a_heads:
+            drop.add(i)
+            continue
+        if len(n) < 12:
+            continue
+        if n in a_set or any(SequenceMatcher(None, n, x, autojunk=False).ratio() >= 0.85
+                             for x in a_long):
+            drop.add(i)
+    if not drop:
+        return bottom
+    grew = True
+    while grew:                           # lan từ dòng lặp dài sang dòng ngắn liền kề
+        grew = False
+        for i in range(lim):
+            if i in drop:
+                continue
+            n = _norm_line(b[i])
+            if n and len(n) < 12 and n in a_set and ((i - 1) in drop or (i + 1) in drop):
+                drop.add(i)
+                grew = True
+    return "\n".join(s for i, s in enumerate(b) if i not in drop).strip()
+
+
+def _drop_dup_half_figures(bottom: str, fig_dir: Path, idx: int) -> str:
+    """Một hình nằm trong dải chồng lấn được Gemini cắt ở CẢ HAI nửa → bỏ bản
+    của nửa dưới (thẻ ảnh + mục json) khi bbox (đã quy về % cả trang) chồng ≥ 50%
+    với một hình nửa trên."""
+    import json as _json
+    import re as _re
+    try:
+        j1 = _json.loads((fig_dir / f"p{idx+1}_gemini_boxes_h1.json").read_text(encoding="utf-8"))
+        p2 = fig_dir / f"p{idx+1}_gemini_boxes_h2.json"
+        j2 = _json.loads(p2.read_text(encoding="utf-8"))
+    except Exception:
+        return bottom
+
+    def _ov(r, q):
+        w = min(r[2], q[2]) - max(r[0], q[0])
+        h = min(r[3], q[3]) - max(r[1], q[1])
+        if w <= 0 or h <= 0:
+            return 0.0
+        ar = max(1e-6, (r[2] - r[0]) * (r[3] - r[1]))
+        aq = max(1e-6, (q[2] - q[0]) * (q[3] - q[1]))
+        return w * h / min(ar, aq)
+
+    tops = [e["bbox"] for e in j1 if e.get("placed") and len(e.get("bbox") or []) == 4]
+    keep = []
+    for e in j2:
+        bb = e.get("bbox") or []
+        if e.get("placed") and len(bb) == 4 and any(_ov(bb, t) >= 0.5 for t in tops):
+            bottom = _re.sub(r'(?m)^[ \t]*!\[[^\]]*\]\(figures/' +
+                             _re.escape(f"p{idx+1}_fig{e['id']}.png") + r'\)[ \t]*$', '', bottom)
+            continue
+        keep.append(e)
+    if len(keep) != len(j2):
+        try:
+            p2.write_text(_json.dumps(keep, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+    return bottom
+
+
+def _use_gemini_boxes(fig_dir: Path, idx: int, keep: str) -> None:
+    """Sau khi chọn kết quả của 1 trang, xoá json hình của lần đọc BỊ BỎ — json
+    thừa sẽ làm bước gắn hình bỏ nhầm hình xác định. keep: full | halves | none."""
+    names = {"full": [f"p{idx+1}_gemini_boxes.json"],
+             "halves": [f"p{idx+1}_gemini_boxes_h1.json",
+                        f"p{idx+1}_gemini_boxes_h2.json"]}
+    for kind, files in names.items():
+        if kind == keep:
+            continue
+        for f in files:
+            try:
+                (fig_dir / f).unlink()
+            except Exception:
+                pass
 
 
 def _looks_truncated(md: str) -> bool:
@@ -1565,23 +1794,35 @@ def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
     results, done = {}, [0]
     failed_pages, truncated_pages = [], []
 
+    def _halves(idx, b, w, is_scan):
+        return _read_page_halves(idx, b, w, fig_dir, is_scan, model,
+                                 niner_url=niner_url, niner_key=niner_key,
+                                 gemini_api_key=api_key,
+                                 dpi=(216 if is_scan else 144))
+
     def _work(idx):
         b, w, h = png_map[idx]
         is_scan = idx in scan_set
+        dpi = 216 if is_scan else 144
         md, why = "", ""
         try:
             md = _gemini_one_page(b, w, h, idx, fig_dir, model=model,
                                   niner_url=niner_url, niner_key=niner_key,
-                                  gemini_api_key=api_key, scan=is_scan)
+                                  gemini_api_key=api_key, scan=is_scan, dpi=dpi)
             if _looks_truncated(md):
-                better = _read_halves_gemini(idx, b, w, h, is_scan)
+                better = _halves(idx, b, w, is_scan)
                 if _meaningful_text_len(better) > _meaningful_text_len(md):
                     md = better
+                    _use_gemini_boxes(fig_dir, idx, "halves")
+                else:
+                    _use_gemini_boxes(fig_dir, idx, "full")
         except VisionTruncated as e:
             truncated_pages.append(idx + 1)
-            md = _read_halves_gemini(idx, b, w, h, is_scan)
+            md = _halves(idx, b, w, is_scan)
+            _use_gemini_boxes(fig_dir, idx, "halves")
             if _meaningful_text_len(md) < _meaningful_text_len(e.partial):
                 md = e.partial
+                _use_gemini_boxes(fig_dir, idx, "none")
             why = "hết hạn mức output"
         except Exception as e:
             why = str(e)[:120]
@@ -1589,7 +1830,8 @@ def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
                 for fb in _GEMINI_DIRECT_MODELS:
                     try:
                         md = _gemini_one_page(b, w, h, idx, fig_dir, model=fb,
-                                              gemini_api_key=api_key, scan=is_scan)
+                                              gemini_api_key=api_key, scan=is_scan,
+                                              dpi=dpi)
                         why = ""
                         break
                     except Exception as e2:
@@ -1602,20 +1844,6 @@ def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
         done[0] += 1
         _emit("gemini", f"Vision đọc trang {done[0]}/{len(page_indices)}…")
         return idx, md
-
-    def _read_halves_gemini(idx, b, w, h, is_scan):
-        halves = _png_halves(b)
-        parts = []
-        for hb in halves:
-            try:
-                parts.append(_gemini_one_page(
-                    hb, w, h // 2, idx, fig_dir, model=model,
-                    niner_url=niner_url, niner_key=niner_key,
-                    gemini_api_key=api_key, scan=is_scan,
-                    prompt_extra=_SCAN_STRIP_HINT))
-            except Exception:
-                continue
-        return "\n\n".join(p for p in parts if p).strip()
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         for fut in as_completed([ex.submit(_work, i) for i in page_indices]):
@@ -2006,46 +2234,43 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
         results[start] = md
         _emit("odl", f"ODL xong dải trang {idxs[0]+1}-{idxs[-1]+1}")
 
-    def _read_halves(idx, b, w, h, is_scan):
+    def _read_halves(idx, b, w, is_scan):
         """Trang bị cắt giữa đường → đọc lại theo 2 nửa chồng lấn rồi nối."""
-        halves = _png_halves(b)
-        if not halves:
-            return ""
-        parts = []
-        for hb in halves:
-            try:
-                parts.append(_gemini_one_page(
-                    hb, w, h // 2, idx, fig_dir, model=gemini_model,
-                    niner_url=niner_url, niner_key=niner_key,
-                    gemini_api_key=gemini_api_key, scan=is_scan,
-                    prompt_extra=_SCAN_STRIP_HINT))
-            except Exception:
-                continue
-        return "\n\n".join(p for p in parts if p).strip()
+        return _read_page_halves(idx, b, w, fig_dir, is_scan, gemini_model,
+                                 niner_url=niner_url, niner_key=niner_key,
+                                 gemini_api_key=gemini_api_key,
+                                 dpi=(216 if is_scan else 144))
 
     def _do_complex(idx):
         b, w, h = png_map[idx]
         is_scan = idx in scan_set
+        dpi = 216 if is_scan else 144
         md, why = "", ""
 
         # Bậc 1: Vision qua 9Router, prompt + zoom theo loại trang
         try:
             md = _gemini_one_page(b, w, h, idx, fig_dir, model=gemini_model,
                                   niner_url=niner_url, niner_key=niner_key,
-                                  gemini_api_key=gemini_api_key, scan=is_scan)
+                                  gemini_api_key=gemini_api_key, scan=is_scan,
+                                  dpi=dpi)
             # Bậc 2: API không báo nhưng trông như bị cắt → đọc lại theo nửa trang
             if _looks_truncated(md):
                 _emit("gemini", f"Trang {idx+1} trông như bị cắt — đọc lại theo nửa trang…")
-                better = _read_halves(idx, b, w, h, is_scan)
+                better = _read_halves(idx, b, w, is_scan)
                 if _meaningful_text_len(better) > _meaningful_text_len(md):
                     md = better
+                    _use_gemini_boxes(fig_dir, idx, "halves")
+                else:
+                    _use_gemini_boxes(fig_dir, idx, "full")
         except VisionTruncated as e:
             # Bậc 2: hết hạn mức output → chia nửa trang
             _emit("gemini", f"Trang {idx+1} dày chữ, hết hạn mức — đọc lại theo nửa trang…")
             truncated_pages.append(idx + 1)
-            md = _read_halves(idx, b, w, h, is_scan)
+            md = _read_halves(idx, b, w, is_scan)
+            _use_gemini_boxes(fig_dir, idx, "halves")
             if _meaningful_text_len(md) < _meaningful_text_len(e.partial):
                 md = e.partial     # thà giữ phần đọc được còn hơn mất trắng
+                _use_gemini_boxes(fig_dir, idx, "none")
             why = "hết hạn mức output"
         except Exception as e:
             why = str(e)[:120]
@@ -2056,7 +2281,8 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
                         _emit("gemini", f"Trang {idx+1}: thử lại bằng {fb}…")
                         md = _gemini_one_page(
                             b, w, h, idx, fig_dir, model=fb,
-                            gemini_api_key=gemini_api_key, scan=is_scan)
+                            gemini_api_key=gemini_api_key, scan=is_scan,
+                            dpi=dpi)
                         why = ""
                         break
                     except Exception as e2:
@@ -2211,7 +2437,8 @@ def _extract_digital_pdf_images(pdf_path: Path, work_dir: Path,
 
 
 def _attach_det_figures(pdf_path: Path, work_dir: Path, md_path: Path,
-                        page_range: str | None, _emit) -> Path:
+                        page_range: str | None, _emit,
+                        scan_pages=None) -> Path:
     """Bước gắn hình XÁC ĐỊNH cho mọi method odl/hybrid/gemini (core.pdf_word_figures):
     ảnh nhúng + hình vector (cùng bộ pdf_figures của luồng nhập đề) → cắt từ trang →
     neo vào câu trong md. Gemini/ODL chỉ là nguồn bổ sung; bước này không bao giờ
@@ -2219,7 +2446,10 @@ def _attach_det_figures(pdf_path: Path, work_dir: Path, md_path: Path,
     try:
         from core.pdf_word_figures import attach_figures
         _emit("img", "Đang trích hình vẽ, đồ thị (ảnh nhúng + vector) và gắn vào câu…")
-        n = attach_figures(pdf_path, work_dir, md_path, page_range=page_range)
+        # scan_pages trong stats đánh số từ 1 → attach_figures dùng chỉ số từ 0
+        scan0 = {int(p) - 1 for p in (scan_pages or ())}
+        n = attach_figures(pdf_path, work_dir, md_path, page_range=page_range,
+                           scan_pages=scan0)
         _emit("img", f"Đã gắn {n} hình vào tài liệu")
     except Exception as e:
         _emit("img", f"Bỏ qua trích hình: {str(e)[:80]}")
@@ -2308,7 +2538,8 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
                                             progress_cb=progress_cb)
         detect = detect_text_layer(str(pdf_path))
         ocr_used = bool(stats.get("ocr_used"))
-        md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit)
+        md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit,
+                                 scan_pages=stats.get("scan_pages"))
 
     elif method == "odl":
         if not odl_available():
@@ -2369,7 +2600,8 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
             # PDF digital có text → trích hình xác định (ảnh nhúng + vector) và neo vào câu.
             # (Thay _extract_digital_pdf_images cũ: chỉ ảnh nhúng, đặt theo Y ước lượng,
             # trùng với ảnh ODL tự xuất, không có hình vector.)
-            md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit)
+            md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit,
+                                 scan_pages=stats.get("scan_pages"))
 
     elif method == "gemini":
         if not gemini_api_key:
@@ -2380,7 +2612,8 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
                                         niner_key=niner_key, progress_cb=progress_cb)
         detect = detect_text_layer(str(pdf_path))
         ocr_used = bool(stats.get("ocr_used"))
-        md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit)
+        md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit,
+                                 scan_pages=stats.get("scan_pages"))
 
     else:  # marker
         if not marker_available():

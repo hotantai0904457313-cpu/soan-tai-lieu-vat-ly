@@ -362,29 +362,60 @@ def _group_rows(rects: list, lines) -> list:
     return sorted(rects, key=lambda r: (r.y0, r.x0))
 
 
-def _gemini_rects(fig_dir: Path, page_no: int, page) -> list:
-    """Vùng Gemini Vision đã cắt hình cho trang này (json do _gemini_one_page ghi)
-    → list (id, Rect)."""
-    p = fig_dir / f"p{page_no}_gemini_boxes.json"
-    if not p.exists():
-        return []
-    try:
-        boxes = json.loads(p.read_text(encoding='utf-8'))
-    except Exception:
-        return []
+def _gemini_boxes(fig_dir: Path, page_no: int, page) -> list:
+    """Mọi hình Gemini Vision khai cho trang này (json do _gemini_one_page ghi:
+    p{N}_gemini_boxes.json, hoặc _h1/_h2 khi trang đọc theo nửa) → list dict
+    {id, rect (Rect|None), placed, caption, anchor}. Json kiểu cũ chỉ chứa hình
+    ĐÃ chèn và không có khoá 'placed' → coi là placed."""
     W, H = page.rect.width, page.rect.height
     out = []
-    for item in boxes:
+    for p in sorted(fig_dir.glob(f"p{page_no}_gemini_boxes*.json")):
         try:
-            if isinstance(item, dict):
-                fid, b = item.get('id'), item.get('bbox')
-            else:
-                fid, b = None, item
-            out.append((fid, fitz.Rect(b[0] / 100 * W, b[1] / 100 * H,
-                                       b[2] / 100 * W, b[3] / 100 * H)))
+            boxes = json.loads(p.read_text(encoding='utf-8'))
         except Exception:
-            pass
+            continue
+        for item in boxes:
+            try:
+                if isinstance(item, dict):
+                    fid, b = item.get('id'), item.get('bbox')
+                    placed = bool(item.get('placed', True))
+                    cap = (item.get('caption') or '').strip()
+                    anc = (item.get('anchor_text') or '').strip()
+                else:
+                    fid, b, placed, cap, anc = None, item, True, '', ''
+                rect = None
+                if b and len(b) == 4:
+                    rect = fitz.Rect(b[0] / 100 * W, b[1] / 100 * H,
+                                     b[2] / 100 * W, b[3] / 100 * H)
+                    if rect.is_empty:
+                        rect = None
+                out.append({'id': fid, 'rect': rect, 'placed': placed,
+                            'caption': cap, 'anchor': anc})
+            except Exception:
+                pass
     return out
+
+
+def _gemini_rects(fig_dir: Path, page_no: int, page) -> list:
+    """Vùng Gemini Vision ĐÃ cắt hình cho trang này → list (id, Rect). Hình Gemini
+    khai mà không cắt được KHÔNG tính — nó không có trong tài liệu nên không được
+    phép thay thế (bỏ) hình xác định."""
+    return [(b['id'], b['rect']) for b in _gemini_boxes(fig_dir, page_no, page)
+            if b['placed'] and b['rect'] is not None]
+
+
+def _recrop_gemini(page, fig_dir: Path, page_no: int, boxes: list) -> int:
+    """Trang SCAN: cắt lại hình Gemini đã chèn TỪ TRANG PDF ở zoom 4 (288 DPI,
+    khớp scan gốc ~300 DPI), đè lên bản cắt từ ảnh render 216 DPI. Tên file giữ
+    nguyên nên thẻ ảnh trong md không đổi. Trả số hình đã cắt lại."""
+    n = 0
+    for b in boxes:
+        if not b['placed'] or b['rect'] is None or b['id'] is None:
+            continue
+        png = fig_dir / f"p{page_no}_fig{b['id']}.png"
+        if png.exists() and _render(page, b['rect'], png, zoom=ZOOM_SCAN):
+            n += 1
+    return n
 
 
 def _dedup_with_gemini(rects: list, gem: list, tables: list) -> tuple:
@@ -485,6 +516,123 @@ def _find_qnum(md_lines: List[str], num: str, cursor: int) -> int:
     return -1
 
 
+_PAGE_MARK_RE = re.compile(r'^\s*<!--\s*p2w:page=(\d+)\s*-->\s*$')
+
+
+def _page_markers(md_lines: List[str]) -> list:
+    """Mốc <!-- p2w:page=N --> (đường lai/Gemini ghi trước nội dung mỗi trang
+    hoặc mỗi DẢI trang ODL) → list (chỉ số dòng, N) theo thứ tự tài liệu."""
+    out = []
+    for i, s in enumerate(md_lines):
+        m = _PAGE_MARK_RE.match(s)
+        if m:
+            out.append((i, int(m.group(1))))
+    return out
+
+
+def _range_for(markers: list, page_no: int, n_lines: int):
+    """Khoảng dòng [lo, hi) chứa nội dung trang page_no: từ mốc gần nhất có số
+    trang ≤ page_no (dải ODL nhiều trang chỉ có 1 mốc ở trang đầu) tới mốc kế.
+    Không có mốc → None (đường ODL thuần: giữ cách tìm toàn tài liệu như cũ)."""
+    best = None
+    for k, (li, pn) in enumerate(markers):
+        if pn <= page_no:
+            best = k
+    if best is None:
+        return None
+    lo = markers[best][0] + 1
+    hi = markers[best + 1][0] if best + 1 < len(markers) else n_lines
+    return lo, hi
+
+
+def _scan_order(lo: int, hi: int, cursor: int) -> list:
+    """Duyệt [lo, hi) bắt đầu từ cursor (vị trí hình trước) rồi vòng lại — như
+    _find_line: số câu reset mỗi PHẦN nên "Câu 2" có thể xuất hiện 2 lần trong
+    cùng một trang, lần nằm SAU hình trước mới là lần đúng."""
+    c = min(max(cursor, lo), hi)
+    return list(range(c, hi)) + list(range(lo, c))
+
+
+def _find_line_in(md_norm: List[str], keys: List[str], lo: int, hi: int,
+                  cursor: int = 0) -> int:
+    for k in keys:
+        if not k:
+            continue
+        for i in _scan_order(lo, hi, cursor):
+            if k in md_norm[i]:
+                return i
+    return -1
+
+
+def _find_qnum_in(md_lines: List[str], num: str, lo: int, hi: int,
+                  cursor: int = 0) -> int:
+    pat = re.compile(r'^\s*(?:\*\*)?\s*(?:Câu|Bài)\s*' + re.escape(num) + r'(?!\d)',
+                     re.IGNORECASE)
+    for i in _scan_order(lo, hi, cursor):
+        if pat.match(md_lines[i]):
+            return i
+    return -1
+
+
+def _y_fallback(md_lines: List[str], lo: int, hi: int, yfrac: float) -> int:
+    """Không neo được bằng chữ → chèn theo vị trí dọc của hình TRONG TRANG: chia
+    nội dung trang thành các khối (đoạn / câu / phương án), hình ở độ cao yfrac
+    thì đặt trước khối thứ round(yfrac × số khối). Có thể lệch vài dòng nhưng
+    luôn đúng trang, đúng vùng — không bao giờ dồn xuống cuối tài liệu."""
+    blocks = []
+    for i in range(lo, hi):
+        s = md_lines[i].strip()
+        if not s or s == '---' or s.startswith('<!--'):
+            continue
+        prev = md_lines[i - 1].strip() if i > lo else ''
+        if (i == lo or not prev or prev == '---' or prev.startswith('<!--')
+                or _BLOCK_START_RE.match(md_lines[i])):
+            blocks.append(i)
+    if not blocks:
+        return lo
+    k = int(round(max(0.0, min(1.0, yfrac)) * len(blocks)))
+    pos = _para_end(md_lines, blocks[-1]) if k >= len(blocks) else blocks[k]
+    # Bám về CÂU: hình thuộc câu gần nhất bắt đầu phía trên nó (hình thường nằm
+    # bên phải/bên dưới đề) → đặt sau phần đề, trước phương án A — không chen
+    # giữa B và C như khi chỉ chia đều theo độ cao.
+    for i in range(min(pos, hi) - 1, lo - 1, -1):
+        if _QBLOCK_RE.match(md_lines[i]):
+            return _stem_end(md_lines, i, hi)
+    return pos
+
+
+# Đầu một câu/ví dụ (để bám hình vào) và dòng mở đầu phương án / ý a) b)
+_QBLOCK_RE = re.compile(r'^\s*(?:\*\*)?\s*(?:Câu|Bài|Ví\s*dụ|Minh\s*họa)\s*\d+',
+                        re.IGNORECASE)
+_OPTION_RE = re.compile(r'^\s*(?:\*\*)?\s*(?:[A-D]|[a-d])\s*(?:\*\*)?\s*[.)]')
+_LEFTOVER_RE = re.compile(r'^\s*\*\[Hình(?::[^\]]*| trong trang gốc)\]\*\s*$')
+
+
+def _stem_end(md_lines: List[str], q: int, hi: int) -> int:
+    """Vị trí ngay trước phương án/ý đầu tiên của câu bắt đầu ở dòng q (hoặc
+    trước câu kế / cuối khoảng nếu câu không có phương án)."""
+    i = q + 1
+    while i < hi:
+        s = md_lines[i]
+        if _OPTION_RE.match(s) or _QBLOCK_RE.match(s) or s.strip() == '---' \
+                or s.lstrip().startswith('<!--'):
+            break
+        i += 1
+    return i
+
+
+def _leftover_near(md_lines: List[str], j: int, lo: int, hi: int,
+                   used: set, radius: int = 6) -> int:
+    """Dòng chú thích "*[Hình…]*" (hình Gemini khai mà không cắt được) gần vị trí
+    chèn j nhất, trong khoảng dòng của trang → hình xác định thay vào đó thay vì
+    để thừa dòng chữ cạnh hình. Không có → -1."""
+    best, dist = -1, radius + 1
+    for i in range(max(lo, j - radius), min(hi, j + radius + 1)):
+        if i not in used and _LEFTOVER_RE.match(md_lines[i]) and abs(i - j) < dist:
+            best, dist = i, abs(i - j)
+    return best
+
+
 def _render(page, rect, out_path: Path, zoom: float = ZOOM) -> bool:
     try:
         clip = fitz.Rect(rect.x0 - 2, rect.y0 - 2, rect.x1 + 2, rect.y1 + 2) & page.rect
@@ -563,10 +711,62 @@ def collect_page_figures(page, fig_dir: Path, page_no: int, lines=None,
     return out, drop_ids, protected
 
 
+def _overlapping(rect, boxes: list) -> list:
+    """Hình Gemini có bbox chồng lấn ≥ 15% (theo hình nhỏ hơn) với rect, chồng
+    nhiều nhất trước."""
+    hits = []
+    for b in boxes:
+        g = b['rect']
+        if g is None:
+            continue
+        ov = _inter_area(rect, g)
+        if ov >= 0.15 * min(_area(rect), _area(g)):
+            hits.append((ov, b))
+    hits.sort(key=lambda t: -t[0])
+    return [b for _, b in hits]
+
+
+def _place_scan_inline(f, tag: str, boxes: list, gem_lines: dict, used_lines: set,
+                       md_lines: List[str], md_norm: List[str], lo: int, hi: int) -> bool:
+    """Trang scan: đặt hình xác định VÀO ĐÚNG DÒNG của hình Gemini cùng vùng —
+    thẻ ảnh Gemini đã chèn, hoặc dòng chú thích "*[Hình: …]*" khi Gemini khai
+    hình mà không cắt được. Gemini đọc cả trang nên chỗ nó đặt hình là chỗ đúng
+    nhất trong bài. Trả True nếu đã đặt."""
+    for b in _overlapping(f['rect'], boxes):
+        li = -1
+        if b['placed'] and b['id'] is not None:
+            try:
+                li = gem_lines.get(int(b['id']), -1)
+            except (TypeError, ValueError):
+                li = -1
+        if li < 0 and not b['placed']:
+            want = f"*[Hình: {b['caption']}]*" if b['caption'] else "*[Hình trong trang gốc]*"
+            for i in range(lo, hi):
+                if i not in used_lines and md_lines[i].strip() == want:
+                    li = i
+                    break
+        if li >= 0 and li not in used_lines:
+            md_lines[li] = tag
+            md_norm[li] = ''
+            used_lines.add(li)
+            return True
+    return False
+
+
 def attach_figures(pdf_path, work_dir, md_path, page_range: str | None = None,
-                   progress_cb=None) -> int:
-    """Trích hình xác định của các trang digital rồi chèn vào md (ghi đè tại chỗ).
-    Trả về số hình đã chèn. Không raise."""
+                   progress_cb=None, scan_pages=None) -> int:
+    """Trích hình xác định rồi chèn vào md (ghi đè tại chỗ). Trả về số hình đã
+    chèn. Không raise.
+
+    scan_pages: tập chỉ số trang (từ 0) là BẢN SCAN. Trang scan:
+      - hình Gemini đã chèn được cắt lại từ trang PDF ở 288 DPI;
+      - lấy ảnh con bằng _scan_raster_rects (bỏ ảnh nền);
+      - neo hình KHÔNG dựa lớp text (thường không có/toàn watermark) mà theo thứ
+        tự: thay đúng chỗ thẻ Gemini cùng vùng → dòng chú thích "[Hình: …]" của
+        hình Gemini không cắt được → anchor_text Gemini khai → chữ OCR của trang
+        → vị trí dọc trong trang. Mọi phép tìm giới hạn trong khoảng dòng của
+        trang (mốc <!-- p2w:page=N -->) nên hình không bao giờ nhảy trang."""
+    scan_set = set(scan_pages or ())
     if fitz is None:
         return 0
     pdf_path, work_dir, md_path = Path(pdf_path), Path(work_dir), Path(md_path)
@@ -596,6 +796,8 @@ def attach_figures(pdf_path, work_dir, md_path, page_range: str | None = None,
         md_text = strip_odl_images(md_text)
         md_lines = md_text.split('\n')
         md_norm = [_norm(s) for s in md_lines]
+        markers = _page_markers(md_lines)
+        used_lines: set = set()
 
         inserts: dict = {}       # vị trí dòng → list thẻ ảnh chèn TRƯỚC dòng đó
         tail: List[str] = []     # không neo được → cuối tài liệu
@@ -608,7 +810,14 @@ def attach_figures(pdf_path, work_dir, md_path, page_range: str | None = None,
             except Exception:
                 continue
             lines = _page_lines(page)
-            figs, drop_ids, protected = collect_page_figures(page, fig_dir, idx + 1, lines)
+            scan = idx in scan_set
+            rng = _range_for(markers, idx + 1, len(md_lines))
+            lo, hi = rng if rng else (0, len(md_lines))
+            boxes = _gemini_boxes(fig_dir, idx + 1, page) if scan else []
+            if scan and boxes:
+                _recrop_gemini(page, fig_dir, idx + 1, boxes)
+            figs, drop_ids, protected = collect_page_figures(page, fig_dir, idx + 1, lines,
+                                                             scan=scan)
             gem_prefix = f"figures/p{idx + 1}_fig"
 
             def _blank_gemini(li: int) -> None:
@@ -621,6 +830,17 @@ def attach_figures(pdf_path, work_dir, md_path, page_range: str | None = None,
                 m = re.search(re.escape(gem_prefix) + r'(\d+)\.png', s)
                 return int(m.group(1)) if m else None
 
+            # Vị trí thẻ Gemini của trang (trước khi bỏ) — trang scan dùng làm chỗ
+            # đặt hình xác định cùng vùng: Gemini đã đặt thẻ đúng chỗ trong bài.
+            gem_lines: dict = {}
+            if scan:
+                for li in range(lo, hi):
+                    s = md_lines[li]
+                    if s.lstrip().startswith('![') and gem_prefix in s:
+                        gid = _gemini_id(s)
+                        if gid is not None:
+                            gem_lines.setdefault(gid, li)
+
             # (a) Thẻ Gemini có bbox chồng lấn hình xác định → bỏ
             for li, s in enumerate(md_lines):
                 if s.lstrip().startswith('![') and gem_prefix in s:
@@ -631,22 +851,62 @@ def attach_figures(pdf_path, work_dir, md_path, page_range: str | None = None,
                 rel = f"figures/{f['png'].name}"
                 tag = f"![]({rel})"
                 pos = -1
+                if scan and _place_scan_inline(f, tag, boxes, gem_lines, used_lines,
+                                               md_lines, md_norm, lo, hi):
+                    total += 1
+                    continue
                 a = f['anchor']
-                if a is not None:
-                    pos = _find_line(md_norm, _anchor_keys(a['text']), cursor)
+                keys = _anchor_keys(a['text']) if a is not None else []
+                if scan:
+                    # anchor_text Gemini khai cho hình cùng vùng — trang scan không
+                    # có lớp text đáng tin để chọn dòng neo
+                    for b in _overlapping(f['rect'], boxes):
+                        if b['anchor']:
+                            keys = _anchor_keys(b['anchor']) + keys
+                            break
+                if rng and keys:
+                    pos = _find_line_in(md_norm, keys, lo, hi, cursor)
+                if pos < 0 and keys and not (scan and rng):
+                    pos = _find_line(md_norm, keys, cursor)
                 if pos < 0 and f['qnum']:
-                    pos = _find_qnum(md_lines, f['qnum'], cursor)
+                    if rng:
+                        pos = _find_qnum_in(md_lines, f['qnum'], lo, hi, cursor)
+                    if pos < 0 and not (scan and rng):
+                        pos = _find_qnum(md_lines, f['qnum'], cursor)
+                if pos < 0 and rng:
+                    H = page.rect.height or 1.0
+                    yfrac = ((f['rect'].y0 + f['rect'].y1) / 2) / H
+                    j = _y_fallback(md_lines, lo, hi, yfrac)
+                    lv = _leftover_near(md_lines, j, lo, hi, used_lines) if scan else -1
+                    if lv >= 0:
+                        md_lines[lv] = tag
+                        md_norm[lv] = ''
+                        used_lines.add(lv)
+                    else:
+                        inserts.setdefault(j, []).append(tag)
+                    total += 1
+                    continue
                 if pos < 0:
                     tail.append(f"![Hình trang {idx + 1}]({rel})")
                     total += 1
                     continue
                 j = _para_end(md_lines, pos)
-                inserts.setdefault(j, []).append(tag)
+                lv = _leftover_near(md_lines, j, lo, hi, used_lines) if scan else -1
+                if lv >= 0:
+                    md_lines[lv] = tag
+                    md_norm[lv] = ''
+                    used_lines.add(lv)
+                else:
+                    inserts.setdefault(j, []).append(tag)
                 cursor = pos
                 total += 1
                 # (b) Cùng CÂU đã có hình xác định → thẻ Gemini cùng trang trong
                 # khối câu đó là cùng một hình (bbox AI lệch nên không chồng lấn)
-                # → bỏ, trừ thẻ được bảo vệ (bảng số liệu).
+                # → bỏ, trừ thẻ được bảo vệ (bảng số liệu). KHÔNG áp cho trang
+                # scan: ảnh con chỉ là một phần hình của trang (phần còn lại nằm
+                # trong ảnh nền), thẻ Gemini khác vùng là hình KHÁC.
+                if scan:
+                    continue
                 qend = pos + 1
                 while qend < len(md_lines) and not _QNUM_RE.match(md_lines[qend]) \
                         and not re.match(r'^\s*(?:\*\*)?\s*(?:PHẦN|Phần)\s', md_lines[qend]):
