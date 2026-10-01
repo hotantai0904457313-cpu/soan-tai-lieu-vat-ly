@@ -183,6 +183,7 @@ async function handleFileImport(file, fileType, pageRange = '') {
     const label = methodLabels[data.import_method] || '';
     const qc = countQuestions(data.document);
     showToast(`Đã nhập: ${file.name}${qc ? ' (' + qc + ' câu)' : ''}${label}`, 'success', 4000);
+    if (data.import_warning) showToast(data.import_warning, 'warning', 15000);
 
     const btnInfo = $('btn-doc-info');
     if (btnInfo) btnInfo.disabled = false;
@@ -1828,7 +1829,8 @@ function p2wRenderStatus(files) {
     else if (f.status === 'error') { icon = '❌'; cls = 'err'; }
     let right;
     if (f.status === 'done') {
-      const ocr = f.ocr_used ? ' · đã OCR' : ' · nhanh';
+      const nScan = (f.scan_pages || []).length;
+      const ocr = nScan ? ` · đã OCR ${nScan} trang scan` : ' · nhanh';
       right = `<button class="p2w-dl" onclick="p2wDownload(${f.index},'${(f.out_name||'').replace(/'/g,'')}')">⬇ Tải Word</button>`
             + `<span class="p2w-status">${f.seconds || ''}s${ocr}</span>`;
     } else {
@@ -1836,6 +1838,15 @@ function p2wRenderStatus(files) {
     }
     row.innerHTML = `<span class="p2w-name ${cls}">${icon} ${f.name}</span>${right}`;
     list.appendChild(row);
+    // Trang không đọc được: nói rõ trang nào, Word đã chèn ảnh trang gốc ở đó
+    const fp = f.failed_pages || [];
+    if (f.status === 'done' && fp.length) {
+      const warn = el('div', 'p2w-warn');
+      warn.textContent = `⚠️ ${fp.length} trang không đọc được chữ (trang `
+        + `${fp.slice(0, 12).join(', ')}${fp.length > 12 ? '…' : ''}) — `
+        + `Word đã chèn ảnh trang gốc ở đó, nên chuyển lại riêng những trang này.`;
+      list.appendChild(warn);
+    }
   });
 }
 

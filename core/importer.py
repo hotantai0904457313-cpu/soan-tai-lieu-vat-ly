@@ -42,9 +42,27 @@ SECTION_PATTERNS = [
 # Có tiền tố "Câu" → chấp nhận mọi dấu phân cách. KHÔNG có tiền tố → lookahead
 # bắt buộc số theo sau bởi . hoặc ) — nếu cho cả ':' và khoảng trắng thì dòng
 # nối tiếp kiểu "10 m/s là vận tốc..." bị tách nhầm thành câu hỏi mới số 10.
+# Số trần còn phải có CHỮ theo sau: mẫu số phân số "2)" đứng một mình không phải
+# câu 2. "Câu N." đứng một mình (nội dung ở dòng kế) vẫn là câu → (.*) cho phép rỗng.
 QUESTION_PATTERN = re.compile(
-    r'^(?=c[aâ]u\s*\d|\d+\s*[.)])(?:c[aâ]u\s*)?(\d+)\s*[.):\s]\s*(.+)',
+    r'^(?=c[aâ]u\s*\d|\d+\s*[.)]\s*\S)(?:c[aâ]u\s*)?(\d+)\s*[.):\s]\s*(.*)',
     re.IGNORECASE | re.UNICODE | re.DOTALL)
+
+_CAU_PREFIX_RE = re.compile(r'\s*c[aâ]u\s*\d', re.IGNORECASE)
+
+
+def match_question(line: str):
+    """QUESTION_PATTERN + lưới an toàn cho số TRẦN (không có chữ 'Câu'): phần sau số phải
+    là câu chữ thật — ≥ 12 ký tự và không bắt đầu bằng chữ thường. '2) cm.' (mẫu số
+    phân số rớt dòng), '6 s.' không phải câu; '3. Tính quãng đường…' là câu."""
+    m = QUESTION_PATTERN.match(line)
+    if not m:
+        return None
+    if not _CAU_PREFIX_RE.match(line):
+        rest = (m.group(2) or '').lstrip('*_ ').strip()
+        if len(rest) < 12 or rest[0].islower():
+            return None
+    return m
 
 # Dấu phương án A–D, chịu được: 'A.', 'A)', 'A:', 'A-', '(A)', '**A.**', 'A\.'
 # (Pandoc escape dấu chấm đầu dòng để không thành list). Nhóm 1 = chữ cái.
@@ -114,9 +132,17 @@ def rescue_options_from_text(q) -> bool:
     return True
 
 
+_SECTION_PRIORITY = ('dung_sai', 'tra_loi_ngan', 'tu_luan', 'ly_thuyet', 'trac_nghiem_lua_chon')
+
+
 def detect_section_type(text: str) -> Optional[str]:
-    for stype, pat in SECTION_PATTERNS:
-        if pat.search(text):
+    """Loại ĐẶC THÙ xét trước loại chung: "PHẦN II - CÂU TRẮC NGHIỆM ĐÚNG SAI" phải là
+    dung_sai dù có chữ "trắc nghiệm" (trước đây khớp trac_nghiem_lua_chon trước →
+    các ý a)/b)/c)/d) không thành sub_items mà dính hết vào đề)."""
+    pats = dict(SECTION_PATTERNS)
+    for stype in _SECTION_PRIORITY:
+        pat = pats.get(stype)
+        if pat and pat.search(text):
             return stype
     return None
 
@@ -225,13 +251,18 @@ def _collect_fallback_images(fallback_doc: Document):
     img_by_qnum: dict = {}
     img_by_order: List = []
     img_by_key: dict = {}
+    # Số câu "duy nhất" phải xét MỌI câu (kể cả câu không hình): trước đây chỉ đếm câu
+    # có hình → Phần III Câu 1 có hình, Phần I Câu 1 không → số 1 bị coi là duy nhất →
+    # hình của Phần III gắn nhầm vào Phần I Câu 1 (mỗi khi khoá (loại phần, số) không có)
+    from collections import Counter
+    counts = Counter(q.number for sec in fallback_doc.sections for q in sec.questions)
     for sec in fallback_doc.sections:
         for qi, q in enumerate(sec.questions):
             if not q.has_images():
                 continue
             val = (list(q.images), [list(x) for x in (q.option_images or [])])
             img_by_key[(sec.type, q.number)] = val
-            img_by_qnum[q.number] = None if q.number in img_by_qnum else val
+            img_by_qnum[q.number] = val if counts[q.number] == 1 else None
             img_by_order.append((sec.type, qi, val))
     return img_by_qnum, img_by_order, img_by_key
 
@@ -441,11 +472,74 @@ def _extract_table_images(page, page_num: int):
     return table_imgs, table_rects
 
 
+# Font Symbol (MathType/Word cũ) ghi ký tự Hy Lạp/toán vào vùng PUA U+F000+mã ASCII:
+# \uf077 = ω, \uf06a = φ, \uf070 = π … → đổi về Unicode để đọc được và để
+# unicode_to_latex xử lý như ký tự thường
+_SYMBOL_PUA = {0xF000 + ord(k): v for k, v in {
+    'a': 'α', 'b': 'β', 'g': 'γ', 'd': 'δ', 'e': 'ε', 'f': 'φ', 'j': 'φ', 'h': 'η',
+    'l': 'λ', 'm': 'μ', 'n': 'ν', 'p': 'π', 'q': 'θ', 'r': 'ρ', 's': 'σ', 't': 'τ',
+    'w': 'ω', 'x': 'ξ', 'k': 'κ', 'c': 'χ', 'y': 'ψ', 'z': 'ζ', 'u': 'υ',
+    'D': 'Δ', 'W': 'Ω', 'F': 'Φ', 'S': 'Σ', 'P': 'Π', 'L': 'Λ', 'Q': 'Θ', 'G': 'Γ', 'Y': 'Ψ',
+}.items()}
+_SYMBOL_PUA.update({0xF0B1: '±', 0xF0B4: '×', 0xF0B8: '÷', 0xF0B9: '≠', 0xF0BB: '≈',
+                    0xF0A3: '≤', 0xF0B3: '≥', 0xF0A5: '∞', 0xF0AE: '→', 0xF0D6: '√',
+                    0xF0F2: '∫', 0xF0B0: '°', 0xF0B7: '·', 0xF0D1: '∇', 0xF0B6: '∂',
+                    0xF0E5: '∑', 0xF0A4: '/', 0xF0BC: '…', 0xF0AD: '↑', 0xF0AF: '↓',
+                    0xF0DE: '⇒', 0xF0DB: '⇔', 0xF02D: '−', 0xF02B: '+', 0xF03D: '='})
+
+
+def _symbol_pua_to_unicode(text: str) -> str:
+    return text.translate(_SYMBOL_PUA) if any(0xF000 <= ord(c) <= 0xF0FF for c in text) else text
+
+
+def _row_fragments_to_text(frags: List[dict]) -> str:
+    """Ghép các mảnh chữ CÙNG HÀNG (đã sắp theo x) thành 1 dòng.
+    Phân số xếp chồng (tử nhỏ phía trên, mẫu ngay dưới, cùng cột x) → 'tử/mẫu':
+    'A. x = 5cos(5πt −' + 'π' (trên) + '2) cm.' (dưới) → 'A. x = 5cos(5πt − π/2) cm.'
+    Trước đây mỗi mảnh là 1 dòng riêng → '2) cm.' bị coi là Câu 2, 'Câu 1.' đứng
+    một mình không khớp QUESTION_PATTERN nên cả câu 1–7 dính vào phần dẫn."""
+    if len(frags) == 1:
+        return frags[0]['text']
+    main_sz = max(f['sz'] for f in frags)
+    used = [False] * len(frags)
+    parts = []
+    for i, f in enumerate(frags):
+        if used[i]:
+            continue
+        piece = f['text']
+        fh = f['y1'] - f['y0']
+        fw = f['x1'] - f['x0']
+        if f['sz'] < 0.85 * main_sz:
+            fc = (f['y0'] + f['y1']) / 2
+            # tìm MẪU SỐ: mảnh khác nằm dưới tử, gần cùng cột x (tử căn giữa trên mẫu)
+            for j in range(i + 1, len(frags)):
+                if used[j]:
+                    continue
+                g = frags[j]
+                gc = (g['y0'] + g['y1']) / 2
+                if gc <= fc + 0.5 * fh:
+                    continue
+                if abs(g['x0'] - f['x0']) > max(6.0, 0.5 * fw):
+                    continue
+                ov = min(f['x1'], g['x1']) - max(f['x0'], g['x0'])
+                if ov < 0.5 * min(fw, g['x1'] - g['x0']):
+                    continue
+                piece = f"{f['text']}/{g['text']}"
+                used[j] = True
+                break
+        used[i] = True
+        parts.append(piece)
+    return re.sub(r'[ \t]{2,}', ' ', ' '.join(p for p in parts if p)).strip()
+
+
 def _page_text_lines(page, inside_table) -> List[dict]:
     """Dòng chữ của trang theo ĐÚNG thứ tự đọc: bbox từng DÒNG (get_text('dict')),
-    sắp theo (cột, y, x). Trước đây sắp theo y-tâm-của-cả-block → đề 2 cột bị trộn
-    và mọi dòng trong 1 block chung 1 y (phương án nhảy lên trên đề)."""
-    lines = []
+    sắp theo (cột, y, x). Các MẢNH cùng hàng (chồng lấn theo chiều dọc với mảnh
+    chữ lớn nhất của hàng) được gộp thành 1 dòng — PDF từ Word tách 'Câu 1.' và
+    nội dung câu, mỗi ký hiệu công thức, tử/mẫu phân số thành mảnh riêng.
+    Trước đây sắp theo y-tâm-của-cả-block → đề 2 cột bị trộn và mọi dòng trong
+    1 block chung 1 y (phương án nhảy lên trên đề)."""
+    frags = []
     try:
         d = page.get_text('dict')
     except Exception:
@@ -454,36 +548,177 @@ def _page_text_lines(page, inside_table) -> List[dict]:
         if b.get('type', 0) != 0:
             continue
         for ln in b.get('lines', []):
-            text = ''.join(sp.get('text', '') for sp in ln.get('spans', [])).strip()
+            spans = ln.get('spans', [])
+            text = ''.join(sp.get('text', '') for sp in spans).strip()
             if not text:
                 continue
             x0, y0, x1, y1 = ln.get('bbox', (0, 0, 0, 0))
             if inside_table((x0, y0, x1, y1)):
                 continue   # đã thành ảnh bảng — bỏ text vỡ
-            lines.append({'y': (y0 + y1) / 2, 'x': x0, 'x1': x1,
-                          'text': text, 'imgs': []})
-    if not lines:
-        return lines
-    # Đề 2 cột: mỗi nửa có ≥8 dòng nằm trọn, chiếm ≥30% số dòng và phủ ≥35%
+            sz = max((sp.get('size', 0) or 0) for sp in spans) or (y1 - y0)
+            frags.append({'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1, 'sz': sz,
+                          'text': _symbol_pua_to_unicode(text)})
+    if not frags:
+        return []
+    # Đề 2 cột: mỗi nửa có ≥8 mảnh nằm trọn, chiếm ≥30% số mảnh và phủ ≥35%
     # chiều cao trang — lưới phương án "A. … B. …" 2 cái/dòng chỉ có vài dòng
     # bên phải, KHÔNG phải 2 cột
     mid = page.rect.width / 2
-    left = [l for l in lines if l['x1'] <= mid + 5]
-    right = [l for l in lines if l['x'] >= mid - 5]
+    left = [f for f in frags if f['x1'] <= mid + 5]
+    right = [f for f in frags if f['x0'] >= mid - 5]
 
-    def _span(ls):
-        return (max(l['y'] for l in ls) - min(l['y'] for l in ls)) if ls else 0
+    def _span(fs):
+        return (max((f['y0'] + f['y1']) / 2 for f in fs)
+                - min((f['y0'] + f['y1']) / 2 for f in fs)) if fs else 0
+    # 2 cột THẬT có rãnh giữa: gần như không mảnh nào vắt ngang giữa trang. Đề 1 cột
+    # với lưới phương án "A. … B. …" + công thức vỡ mảnh bên phải từng bị nhận nhầm
+    # 2 cột (trang có 23/118 mảnh vắt ngang) → phương án B/D bị đẩy xuống cuối trang
+    cross = [f for f in frags if f['x0'] < mid - 5 and f['x1'] > mid + 5]
     min_h = 0.35 * page.rect.height
     two_col = (len(left) >= 8 and len(right) >= 8
-               and len(left) >= 0.3 * len(lines) and len(right) >= 0.3 * len(lines)
-               and _span(left) >= min_h and _span(right) >= min_h)
-    if two_col:
-        for l in lines:
-            l['col'] = 1 if l['x'] >= mid - 5 else 0
-        lines.sort(key=lambda l: (l['col'], round(l['y'], 1), l['x']))
-    else:
-        lines.sort(key=lambda l: (round(l['y'], 1), l['x']))
+               and len(left) >= 0.3 * len(frags) and len(right) >= 0.3 * len(frags)
+               and _span(left) >= min_h and _span(right) >= min_h
+               and len(cross) <= max(2, 0.05 * len(frags)))
+    for f in frags:
+        f['col'] = (1 if f['x0'] >= mid - 5 else 0) if two_col else 0
+
+    # Gộp hàng: mảnh chồng lấn dọc ≥ 40% chiều cao (so với mảnh lớn nhất hàng)
+    lines = []
+    for col in sorted({f['col'] for f in frags}):
+        cf = sorted((f for f in frags if f['col'] == col), key=lambda f: (f['y0'], f['x0']))
+        rows: List[List[dict]] = []
+        for f in cf:
+            placed = False
+            for row in rows[-3:]:          # chỉ cần dò vài hàng gần nhất
+                a = max(row, key=lambda r: r['sz'])
+                ov = min(a['y1'], f['y1']) - max(a['y0'], f['y0'])
+                if ov >= 0.4 * min(a['y1'] - a['y0'], f['y1'] - f['y0']):
+                    row.append(f)
+                    placed = True
+                    break
+            if not placed:
+                rows.append([f])
+        for row in rows:
+            row.sort(key=lambda f: f['x0'])
+            a = max(row, key=lambda r: r['sz'])
+            lines.append({'y': (a['y0'] + a['y1']) / 2, 'x': min(f['x0'] for f in row),
+                          'x1': max(f['x1'] for f in row), 'col': col,
+                          'text': _row_fragments_to_text(row), 'imgs': []})
+    lines.sort(key=lambda l: (l['col'], round(l['y'], 1), l['x']))
     return lines
+
+
+def _pdf_page_items(pdf_doc, page_num: int, save_images: bool = True,
+                    y_range=None) -> list:
+    """Items (text, [ảnh]) của MỘT trang PDF theo thứ tự đọc — dùng chung cho
+    import_pdf (cả file) và đọc-bù từng trang khi Gemini Vision bị chặn.
+    save_images=False: chỉ lấy chữ (ảnh đã được trích ở lượt import_file trước đó)."""
+    import fitz  # noqa: F401 — giữ import cục bộ như import_pdf
+    page = pdf_doc[page_num]
+    page_h = page.rect.height
+    items: list = []
+
+    # Bảng số liệu → ảnh; text ruột bảng sẽ bị loại khỏi luồng text
+    table_imgs, table_rects = _extract_table_images(page, page_num)
+
+    def _inside_table(b):
+        if not table_rects:
+            return False
+        bx0, by0, bx1, by1 = b[0], b[1], b[2], b[3]
+        area = max((bx1 - bx0) * (by1 - by0), 1e-6)
+        for tr in table_rects:
+            iw = max(0.0, min(bx1, tr.x1) - max(bx0, tr.x0))
+            ih = max(0.0, min(by1, tr.y1) - max(by0, tr.y0))
+            if iw * ih > 0.5 * area:
+                return True
+        return False
+
+    text_blocks = _page_text_lines(page, _inside_table)
+
+    if not save_images:
+        if y_range:
+            text_blocks = [tb for tb in text_blocks if y_range[0] <= tb['y'] < y_range[1]]
+        return [(tb['text'], []) for tb in text_blocks]
+
+    # Gắn ảnh bảng vào dòng text gần nhất PHÍA TRÊN bảng (câu dẫn)
+    for tinfo in table_imgs:
+        tbl_y = tinfo['y0']
+        best_block = None
+        best_dist = float('inf')
+        for tb in text_blocks:
+            if tb['y'] <= tbl_y and tbl_y - tb['y'] < best_dist:
+                best_dist = tbl_y - tb['y']
+                best_block = tb
+        if best_block is None and text_blocks:
+            best_block = min(text_blocks, key=lambda x: abs(x['y'] - tbl_y))
+        if best_block:
+            best_block['imgs'].append(tinfo['fname'])
+        else:
+            items.append(('', [tinfo['fname']]))
+
+    img_list_raw = page.get_images(full=True)
+    img_x: dict = {}       # x0 của từng ảnh → 4 hình cùng dòng sắp A→D trái sang phải
+    for img_index, img_info in enumerate(img_list_raw):
+        xref = img_info[0]
+        try:
+            base_img = pdf_doc.extract_image(xref)
+            img_bytes = base_img['image']
+            w = base_img.get('width', 0)
+            h = base_img.get('height', 0)
+            if w < PDF_MIN_IMG_PX or h < PDF_MIN_IMG_PX:
+                continue
+            # uuid tiền tố: tên 'p0_0.png' từng TRÙNG giữa các lần nhập → tài liệu
+            # cũ hiện hình của đề khác
+            fname = f'{uuid.uuid4().hex[:8]}_p{page_num}_{img_index}.png'
+            saved = sharpen_image(img_bytes, fname)
+            img_y = page_h * (img_index + 1) / (len(img_list_raw) + 1)
+            try:
+                rects = page.get_image_rects(xref)
+                if rects:
+                    img_y = (rects[0].y0 + rects[0].y1) / 2
+                    img_x[saved] = rects[0].x0
+            except Exception:
+                pass
+            best_block = None
+            best_dist = float('inf')
+            for tb in text_blocks:
+                if tb['y'] <= img_y:
+                    dist = img_y - tb['y']
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_block = tb
+            if best_block is None and text_blocks:
+                best_block = min(text_blocks, key=lambda x: abs(x['y'] - img_y))
+            if best_block:
+                best_block['imgs'].append(saved)
+            else:
+                items.append(('', [saved]))
+        except Exception:
+            pass
+
+    # === Đồ thị VECTOR (không phải ảnh nhúng) — gắn tại đây khi có core.pdf_figures ===
+    try:
+        from core.pdf_figures import extract_vector_figures, figure_anchor_line
+        line_rects = [(tb['x'], tb['y'] - 5, tb['x1'], tb['y'] + 5) for tb in text_blocks]
+        for fig in extract_vector_figures(page, table_rects=table_rects,
+                                          text_lines=line_rects):
+            fname = f'{uuid.uuid4().hex[:8]}_p{page_num}_vec{len(img_x)}.png'
+            saved = sharpen_image(fig['png'], fname)
+            img_x[saved] = fig['rect'].x0
+            idx = figure_anchor_line(fig['rect'], text_blocks)
+            if idx is not None:
+                text_blocks[idx]['imgs'].append(saved)
+            else:
+                items.append(('', [saved]))
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f'[pdf_figures] trang {page_num}: {e}', flush=True)
+
+    for tb in text_blocks:
+        tb['imgs'].sort(key=lambda f: img_x.get(f, -1))
+        items.append((tb['text'], tb['imgs']))
+    return items
 
 
 def import_pdf(filepath: str) -> Document:
@@ -497,104 +732,7 @@ def import_pdf(filepath: str) -> Document:
     try:
         pdf_doc = fitz.open(filepath)
         for page_num in range(len(pdf_doc)):
-            page = pdf_doc[page_num]
-            page_h = page.rect.height
-
-            # Bảng số liệu → ảnh; text ruột bảng sẽ bị loại khỏi luồng text
-            table_imgs, table_rects = _extract_table_images(page, page_num)
-
-            def _inside_table(b):
-                if not table_rects:
-                    return False
-                bx0, by0, bx1, by1 = b[0], b[1], b[2], b[3]
-                area = max((bx1 - bx0) * (by1 - by0), 1e-6)
-                for tr in table_rects:
-                    iw = max(0.0, min(bx1, tr.x1) - max(bx0, tr.x0))
-                    ih = max(0.0, min(by1, tr.y1) - max(by0, tr.y0))
-                    if iw * ih > 0.5 * area:
-                        return True
-                return False
-
-            text_blocks = _page_text_lines(page, _inside_table)
-
-            # Gắn ảnh bảng vào dòng text gần nhất PHÍA TRÊN bảng (câu dẫn)
-            for tinfo in table_imgs:
-                tbl_y = tinfo['y0']
-                best_block = None
-                best_dist = float('inf')
-                for tb in text_blocks:
-                    if tb['y'] <= tbl_y and tbl_y - tb['y'] < best_dist:
-                        best_dist = tbl_y - tb['y']
-                        best_block = tb
-                if best_block is None and text_blocks:
-                    best_block = min(text_blocks, key=lambda x: abs(x['y'] - tbl_y))
-                if best_block:
-                    best_block['imgs'].append(tinfo['fname'])
-                else:
-                    items.append(('', [tinfo['fname']]))
-
-            img_list_raw = page.get_images(full=True)
-            img_x: dict = {}       # x0 của từng ảnh → 4 hình cùng dòng sắp A→D trái sang phải
-            for img_index, img_info in enumerate(img_list_raw):
-                xref = img_info[0]
-                try:
-                    base_img = pdf_doc.extract_image(xref)
-                    img_bytes = base_img['image']
-                    w = base_img.get('width', 0)
-                    h = base_img.get('height', 0)
-                    if w < PDF_MIN_IMG_PX or h < PDF_MIN_IMG_PX:
-                        continue
-                    # uuid tiền tố: tên 'p0_0.png' từng TRÙNG giữa các lần nhập → tài liệu
-                    # cũ hiện hình của đề khác
-                    fname = f'{uuid.uuid4().hex[:8]}_p{page_num}_{img_index}.png'
-                    saved = sharpen_image(img_bytes, fname)
-                    img_y = page_h * (img_index + 1) / (len(img_list_raw) + 1)
-                    try:
-                        rects = page.get_image_rects(xref)
-                        if rects:
-                            img_y = (rects[0].y0 + rects[0].y1) / 2
-                            img_x[saved] = rects[0].x0
-                    except Exception:
-                        pass
-                    best_block = None
-                    best_dist = float('inf')
-                    for tb in text_blocks:
-                        if tb['y'] <= img_y:
-                            dist = img_y - tb['y']
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_block = tb
-                    if best_block is None and text_blocks:
-                        best_block = min(text_blocks, key=lambda x: abs(x['y'] - img_y))
-                    if best_block:
-                        best_block['imgs'].append(saved)
-                    else:
-                        items.append(('', [saved]))
-                except Exception:
-                    pass
-
-            # === Đồ thị VECTOR (không phải ảnh nhúng) — gắn tại đây khi có core.pdf_figures ===
-            try:
-                from core.pdf_figures import extract_vector_figures, figure_anchor_line
-                line_rects = [(tb['x'], tb['y'] - 5, tb['x1'], tb['y'] + 5) for tb in text_blocks]
-                for fig in extract_vector_figures(page, table_rects=table_rects,
-                                                  text_lines=line_rects):
-                    fname = f'{uuid.uuid4().hex[:8]}_p{page_num}_vec{len(img_x)}.png'
-                    saved = sharpen_image(fig['png'], fname)
-                    img_x[saved] = fig['rect'].x0
-                    idx = figure_anchor_line(fig['rect'], text_blocks)
-                    if idx is not None:
-                        text_blocks[idx]['imgs'].append(saved)
-                    else:
-                        items.append(('', [saved]))
-            except ImportError:
-                pass
-            except Exception as e:
-                print(f'[pdf_figures] trang {page_num}: {e}', flush=True)
-
-            for tb in text_blocks:
-                tb['imgs'].sort(key=lambda f: img_x.get(f, -1))
-                items.append((tb['text'], tb['imgs']))
+            items.extend(_pdf_page_items(pdf_doc, page_num))
     except Exception:
         # Lỗi giữa chừng → thử fallback pdfplumber, bỏ items dở của fitz
         items.clear()
@@ -618,6 +756,42 @@ def import_pdf(filepath: str) -> Document:
 
     _build_sections_from_items(doc, items)
     return doc
+
+
+def _pdf_pages_sections(pdf_path: str, page_nums: List[int], y_range=None) -> list:
+    """Đọc THƯỜNG (lớp chữ) các trang chỉ định → list section dict cùng dạng JSON
+    Vision, để thay thế trang bị Gemini chặn (finish_reason 'recitation').
+    Ảnh không lấy lại ở đây — _json_to_document gắn lại từ bộ ảnh của import_file.
+    Trang scan không có lớp chữ → []."""
+    import fitz
+    items: list = []
+    pdf_doc = None
+    try:
+        pdf_doc = fitz.open(pdf_path)
+        for pn in page_nums:
+            if 0 <= pn < len(pdf_doc):
+                items.extend(_pdf_page_items(pdf_doc, pn, save_images=False, y_range=y_range))
+    except Exception as e:
+        print(f'[đọc thường trang {page_nums}] {e}', flush=True)
+        return []
+    finally:
+        if pdf_doc is not None:
+            try:
+                pdf_doc.close()
+            except Exception:
+                pass
+    if not any((t or '').strip() for t, _ in items):
+        return []
+    tmp = Document()
+    _build_sections_from_items(tmp, items)
+    out = []
+    for sec in tmp.sections:
+        qs = [{'number': q.number, 'text': q.text, 'options': list(q.options),
+               'sub_items': list(q.sub_items)} for q in sec.questions]
+        if qs or (sec.intro or '').strip():
+            out.append({'type': sec.type, 'label': sec.label, 'intro': sec.intro or '',
+                        'questions': qs})
+    return out
 
 
 # ── Xây dựng sections từ danh sách items (dùng cho import thông thường) ──
@@ -700,7 +874,7 @@ def _build_sections_from_items(doc: Document, items):
         if current_section is None:
             current_section = Section(type='khac', label='')
 
-        m_q = QUESTION_PATTERN.match(line)
+        m_q = match_question(line)
         if m_q:
             flush_question()
             q_number = int(m_q.group(1))
@@ -741,7 +915,7 @@ def _build_sections_from_items(doc: Document, items):
 
             # Hàng bảng Markdown nối bằng \n để giữ cấu trúc bảng
             sep = '\n' if (line.startswith('|') or current_question.text.rstrip().endswith('|')) else ' '
-            current_question.text += sep + line
+            current_question.text = (current_question.text + sep + line) if current_question.text else line
             attach_images(img_list, current_question)
         else:
             current_section.intro += (' ' + line if current_section.intro else line)
@@ -868,17 +1042,28 @@ def _call_gemini_vision_json(page_images: List[PILImage.Image], gemini_key: str)
     parts = [VISION_JSON_PROMPT] + page_images
     last_err = None
     # Thứ tự ưu tiên: flash (cân bằng chất lượng/tốc độ) → lite (nhanh hơn) → 2.5 (chậm nhất)
-    for model_name in ('gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-2.0-flash-lite'):
+    # gemini-2.0-flash đã bị Google gỡ (404, 09/2026); 2.5-flash-lite hay cạn quota ngày
+    for model_name in ('gemini-2.5-flash', 'gemini-3.6-flash', 'gemini-2.5-flash-lite'):
         for use_mime in (True, False):
             try:
                 model = genai.GenerativeModel(model_name)
                 cfg = {'max_output_tokens': 32768, 'temperature': 0.1}
                 if use_mime:
                     cfg['response_mime_type'] = 'application/json'
-                resp = model.generate_content(parts, generation_config=cfg)
+                resp = model.generate_content(parts, generation_config=cfg,
+                                              request_options={'timeout': 180})
+                cand = resp.candidates[0] if getattr(resp, 'candidates', None) else None
+                fr = getattr(cand, 'finish_reason', None)
+                fr_name = str(getattr(fr, 'name', fr) or '').upper()
+                if fr_name in ('RECITATION', 'SAFETY', 'BLOCKLIST', 'PROHIBITED_CONTENT') \
+                        or fr == 4:
+                    # Bộ lọc Google chặn — model khác cũng chặn y hệt, đừng thử tiếp
+                    raise VisionBlocked(fr_name or str(fr))
                 text = resp.text
                 if text and len(text.strip()) > 10:
                     return text
+            except VisionBlocked:
+                raise
             except Exception as e:
                 last_err = e
                 err_s = str(e)
@@ -1193,20 +1378,10 @@ def import_with_vision(filepath: str, gemini_key: str) -> Document:
         raise
 
 
-# ── Import qua 9Router (Gemini 3 Flash) — chạy SONG SONG theo cụm trang ──
-#
-# Vì sao theo cụm + giới hạn luồng: Gemini CLI (free) qua 9Router bị rate-limit chặt.
-# Chia PDF thành các cụm trang, gọi song song TỐI ĐA 2 luồng + retry/backoff khi 429.
-# Gộp kết quả: nối các phần cùng loại liền nhau → phần bị cắt ngang trang vẫn liền mạch.
-
-# ĐO THỰC TẾ: Gemini CLI (free) qua 9Router xử lý TUẦN TỰ request cùng tài khoản → chia trang
-# chạy "song song" thực chất nối đuôi (2 trang = 72s thay vì 40s) + làm vỡ đánh số/ghép phần khi
-# câu bị cắt ngang trang. Độ trễ ~40s là SÀN của model, không chia nhỏ được trên gói free.
-# → Để BATCH lớn = gọi 1 lần cho cả đề: cùng tốc độ Gemini API trực tiếp nhưng model mới hơn,
-#   đọc công thức/hình tốt hơn, KHÔNG vỡ cấu trúc. (Hạ BATCH xuống nếu sau này dùng gói trả phí
-#   chạy song song thật.)
-P2W_VISION_BATCH = 24     # ≥ max trang render (16) → thực tế luôn 1 call
-P2W_VISION_WORKERS = 3    # chỉ dùng khi BATCH nhỏ (gói trả phí); free thì vô hiệu vì serialize
+# ── Import qua 9Router (Gemini qua Antigravity) ──
+# Lượt 1 gọi CẢ ĐỀ trong 1 request (giữ liền mạch câu vắt trang). Chỉ khi Google chặn
+# 'recitation' mới chia từng trang (song song P2W_VISION_WORKERS luồng) → dải → lớp chữ.
+P2W_VISION_WORKERS = 3    # số trang gọi song song ở lượt 2 (9Router từng sập khi dồn dập → không tăng)
 
 
 def _pil_to_jpeg_b64(img: PILImage.Image, max_side: int = 2000, quality: int = 85) -> str:
@@ -1222,17 +1397,33 @@ def _pil_to_jpeg_b64(img: PILImage.Image, max_side: int = 2000, quality: int = 8
     return base64.b64encode(buf.getvalue()).decode()
 
 
+class VisionBlocked(RuntimeError):
+    """Model trả RỖNG vì bộ lọc của Google (finish_reason 'recitation' — đề trùng nguyên
+    văn nội dung phổ biến trên mạng — hoặc safety). Không phải lỗi mạng: retry cùng
+    ảnh/cùng model là vô ích, phải đổi cách (chia dải ảnh, đọc lớp chữ)."""
+
+
+_BLOCK_REASONS = ('recitation', 'content_filter', 'safety', 'blocklist', 'prohibited_content')
+
+# Nhắc khi gửi MỘT DẢI của trang (trang bị chặn recitation → chia 3 dải): câu cụt ở mép
+# thì bỏ, dải kế (chồng lấn 1/3) sẽ có trọn câu đó
+_STRIP_HINT = ("LƯU Ý: ảnh này chỉ là MỘT PHẦN của trang. Câu nào bị cắt cụt ở mép trên hoặc mép "
+               "dưới ảnh (thiếu đầu câu hoặc thiếu phương án) → BỎ QUA hoàn toàn, không đưa vào "
+               "JSON. Chỉ ghi các câu nhìn thấy TRỌN VẸN.\n\n")
+
+
 def _call_9router_vision_json(page_images: List[PILImage.Image], niner_key: str,
                               niner_url: str = 'http://localhost:20128/v1',
                               model: str = 'ag/gemini-3.7-flash-low',
-                              max_retries: int = 3) -> str:
-    """Gọi Gemini 3 Flash qua 9Router (OpenAI-compatible) với ảnh base64 → trả raw text JSON.
-    Retry/backoff khi gặp 429."""
+                              max_retries: int = 3, prompt: str = None) -> str:
+    """Gọi Gemini qua 9Router (OpenAI-compatible) với ảnh base64 → trả raw text JSON.
+    Retry/backoff khi gặp 429. Trả rỗng / finish_reason recitation → VisionBlocked
+    (KHÔNG retry — 3 lần thử cùng ảnh đều bị chặn y hệt, chỉ tốn 5–10s)."""
     import time as _t
     from openai import OpenAI
     client = OpenAI(api_key=niner_key or '9router', base_url=niner_url,
                     timeout=180, max_retries=0)
-    content = [{"type": "text", "text": VISION_JSON_PROMPT}]
+    content = [{"type": "text", "text": prompt or VISION_JSON_PROMPT}]
     for img in page_images:
         content.append({"type": "image_url", "image_url": {
             "url": "data:image/jpeg;base64," + _pil_to_jpeg_b64(img)}})
@@ -1243,7 +1434,14 @@ def _call_9router_vision_json(page_images: List[PILImage.Image], niner_key: str,
                 model=model,
                 messages=[{"role": "user", "content": content}],
                 temperature=0.1, max_tokens=16000)
-            return (resp.choices[0].message.content or '').strip()
+            ch = resp.choices[0]
+            text = (ch.message.content or '').strip()
+            reason = (getattr(ch, 'finish_reason', '') or '').lower()
+            if reason in _BLOCK_REASONS or not text:
+                raise VisionBlocked(reason or 'empty')
+            return text
+        except VisionBlocked:
+            raise
         except Exception as e:
             last_err = e
             es = str(e).lower()
@@ -1254,29 +1452,196 @@ def _call_9router_vision_json(page_images: List[PILImage.Image], niner_key: str,
     raise RuntimeError(f'9Router Vision thất bại sau {max_retries} lần: {last_err}')
 
 
-def _merge_vision_sections(section_lists: List[list]) -> list:
-    """Gộp sections từ nhiều batch (theo thứ tự trang). Nối phần cùng type + label liền nhau."""
+def _q_len(q: dict) -> int:
+    return len(q.get('text') or '') + sum(len(o) for o in (q.get('options') or [])) \
+        + sum(len(s) for s in (q.get('sub_items') or []))
+
+
+def _norm_label(s: str) -> str:
+    return re.sub(r'[^0-9a-zà-ỹ]+', '', (s or '').lower())
+
+
+_PART_ID_RE = re.compile(r'ph[àầa]n\s*([ivx]+|\d+)\b', re.IGNORECASE)
+
+
+def _part_id(label: str) -> str:
+    m = _PART_ID_RE.search(label or '')
+    return m.group(1).lower() if m else ''
+
+
+def _merge_vision_sections(section_lists: List[list], dedupe: str = '') -> list:
+    """Gộp sections từ nhiều batch (theo thứ tự trang/dải). Nối phần cùng type khi:
+    không nhãn, nhãn trùng, hoặc nhãn này là dạng rút gọn của nhãn kia ("PHẦN I" vs
+    "PHẦN I - CÂU TRẮC NGHIỆM…" — AI tự đặt nhãn cho trang không có tiêu đề); phần
+    'khac' KHÔNG nhãn đứng sau phần khác = phần tiếp nối.
+    dedupe='any': các dải chồng lấn của 1 trang → câu trùng số ở BẤT KỲ đâu trong phần
+    → giữ bản dài hơn. dedupe='last': ghép các trang → chỉ so với câu CUỐI (câu vắt
+    trang xuất hiện 2 lần liền nhau); không so xa hơn để không gộp nhầm 2 câu khác."""
     merged: list = []
+
+    def _add_q(sec: dict, q: dict):
+        qs = sec.setdefault('questions', [])
+        if dedupe and qs:
+            num = str(q.get('number'))
+            cands = range(len(qs)) if dedupe == 'any' else (len(qs) - 1,)
+            for k in cands:
+                if str(qs[k].get('number')) == num:
+                    if _q_len(q) > _q_len(qs[k]):
+                        qs[k] = q
+                    return
+        qs.append(q)
+
     for sections in section_lists:
         for sec in (sections or []):
             if not isinstance(sec, dict):
                 continue
-            if merged and sec.get('type') == merged[-1].get('type') and (
-                    not sec.get('label') or sec.get('label') == merged[-1].get('label')):
-                merged[-1].setdefault('questions', []).extend(sec.get('questions') or [])
+            stype = sec.get('type') or 'khac'
+            label = (sec.get('label') or '').strip()
+            cont = False
+            if merged:
+                pl, nl = _norm_label(merged[-1].get('label')), _norm_label(label)
+                same_type = stype == merged[-1].get('type')
+                pid, nid = _part_id(merged[-1].get('label')), _part_id(label)
+                # Đề VN mỗi loại chỉ có 1 phần → 2 phần cùng type liền nhau = 1 phần bị
+                # cắt (trang/dải); AI hay tự đặt nhãn ngắn ("TRẮC NGHIỆM", "PHẦN I") cho
+                # trang không có tiêu đề. Chỉ tách khi 2 nhãn ghi số PHẦN khác nhau.
+                cont = (same_type and (not nl or nl == pl or not pid or not nid or pid == nid)) \
+                    or (stype == 'khac' and not nl)
+            if cont:
+                for q in (sec.get('questions') or []):
+                    _add_q(merged[-1], q)
                 if sec.get('intro') and not merged[-1].get('intro'):
                     merged[-1]['intro'] = sec['intro']
+                if len(label) > len(merged[-1].get('label') or ''):
+                    merged[-1]['label'] = label
             else:
-                merged.append(sec)
+                new_sec = dict(sec)
+                new_sec['questions'] = []
+                for q in (sec.get('questions') or []):
+                    _add_q(new_sec, q)
+                merged.append(new_sec)
     return merged
+
+
+def _page_with_next(page_images: List[PILImage.Image], i: int, frac: float = 0.22) -> PILImage.Image:
+    """Ảnh trang i + dải TRÊN của trang i+1 (22 % chiều cao): câu/ý a-b-c-d vắt trang
+    được thấy trọn trong 1 ảnh (chỉ xảy ra khi phải đọc từng trang; gọi cả đề thì
+    AI thấy mọi trang). Phần đuôi cụt ở ảnh trang i+1 sẽ bị bỏ theo _STRIP_HINT và
+    bản trùng được dedupe 'last' loại."""
+    img = page_images[i]
+    if i + 1 >= len(page_images):
+        return img
+    nxt = page_images[i + 1]
+    w, h = img.size
+    nh = int(nxt.size[1] * frac)
+    if nh <= 0:
+        return img
+    tail = nxt.crop((0, 0, nxt.size[0], nh))
+    if tail.size[0] != w:
+        tail = tail.resize((w, int(nh * w / max(tail.size[0], 1))))
+    out = PILImage.new('RGB', (w, h + tail.size[1]), 'white')
+    out.paste(img.convert('RGB'), (0, 0))
+    out.paste(tail.convert('RGB'), (0, h))
+    return out
+
+
+def _page_strips(img: PILImage.Image, n: int = 3):
+    """Chia ảnh trang thành n dải ngang chồng lấn 1/3 dải (câu cụt ở dải này sẽ trọn ở
+    dải kế). Trả [(y0_px, y1_px, ảnh cắt)]."""
+    w, h = img.size
+    sh = h / n
+    ov = int(sh / 3)
+    out = []
+    for i in range(n):
+        y0 = max(0, int(i * sh) - ov)
+        y1 = min(h, int((i + 1) * sh) + ov)
+        out.append((y0, y1, img.crop((0, y0, w, y1))))
+    return out
+
+
+def _section_numbers(sections: list) -> set:
+    return {str(q.get('number')) for sec in (sections or []) for q in (sec.get('questions') or [])}
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fill_missing_from_regex(page_secs: list, regex_secs: list) -> list:
+    """Câu có trong lớp chữ (đọc thường) nhưng Vision (dải) làm rơi → chèn bản đọc thường
+    vào đúng phần, đúng thứ tự số. Phần đích: cùng type (PHẦN II → phần dung_sai của
+    trang); phần 'khac' của lớp chữ = phần tiếp nối đầu trang → phần ĐẦU của trang;
+    không có → phần cuối. Lưới an toàn cuối cùng để không mất câu — công thức bản
+    đọc thường có thể vỡ nhưng còn hơn mất."""
+    added = []
+    for rsec in (regex_secs or []):
+        rtype = rsec.get('type') or 'khac'
+        rqs = [q for q in (rsec.get('questions') or [])
+               if len((q.get('text') or '').strip()) >= 15]
+        if not rqs:
+            continue
+        target = None
+        if rtype != 'khac':
+            target = next((s for s in page_secs if (s.get('type') or 'khac') == rtype), None)
+        elif page_secs:
+            target = page_secs[0]
+        if target is None and page_secs:
+            target = page_secs[-1]
+        if target is None:
+            page_secs.append({'type': rtype, 'label': rsec.get('label') or '',
+                              'intro': rsec.get('intro') or '', 'questions': list(rqs)})
+            added += [str(q.get('number')) for q in rqs]
+            continue
+        ttype = target.get('type') or 'khac'
+        peers = [s for s in page_secs
+                 if ttype == 'khac' or (s.get('type') or 'khac') == ttype] or [target]
+        have = {str(x.get('number')) for s in peers for x in (s.get('questions') or [])}
+        for q in rqs:
+            num = str(q.get('number'))
+            if num in have:
+                continue
+            n = _int_or_none(num)
+            # Chèn vào phần (cùng type) đang chứa câu N−1 (sau nó) hoặc N+1 (trước nó);
+            # không có → phần đích, đúng thứ tự số. Các phần cùng type sẽ được gộp sau.
+            dest, idx = target, None
+            if n is not None:
+                for s in peers:
+                    nums = [_int_or_none(x.get('number')) for x in (s.get('questions') or [])]
+                    if (n - 1) in nums:
+                        dest, idx = s, len(nums) - 1 - nums[::-1].index(n - 1) + 1
+                        break
+                    if (n + 1) in nums:
+                        dest, idx = s, nums.index(n + 1)
+                        break
+            qs = dest.setdefault('questions', [])
+            if idx is None:
+                idx = len(qs)
+                if n is not None:
+                    for k, x in enumerate(qs):
+                        xn = _int_or_none(x.get('number'))
+                        if xn is not None and xn > n:
+                            idx = k
+                            break
+            qs.insert(idx, q)
+            have.add(num)
+            added.append(num)
+    return added
 
 
 def import_with_vision_9router(filepath: str, niner_key: str,
                                niner_url: str = 'http://localhost:20128/v1',
                                model: str = 'ag/gemini-3.7-flash-low',
                                gemini_key: str = '') -> Document:
-    """Import PDF/DOCX bằng Gemini 3 Flash qua 9Router, render trang → gọi SONG SONG theo cụm.
-    Fallback: Gemini API trực tiếp (nếu có key) → import_file."""
+    """Import PDF/DOCX bằng Gemini qua 9Router.
+    Lượt 1: cả đề trong 1 lần gọi (giữ liền mạch câu vắt trang, nhanh nhất).
+    Bị Google chặn 'recitation' (đề trùng nguyên văn nội dung phổ biến — chặn cả
+    phản hồi dù chỉ 1 đoạn trùng) → lượt 2: từng trang song song; trang bị chặn →
+    3 dải chồng lấn; dải bị chặn → đọc lớp chữ của PDF vùng đó; câu còn thiếu so với
+    lớp chữ → chèn bản đọc thường. Ghi doc.import_warning để UI báo thầy kiểm tra.
+    Fallback lỗi khác: Gemini API trực tiếp (nếu có key) → import_file."""
     from concurrent.futures import ThreadPoolExecutor
     title = os.path.splitext(os.path.basename(filepath))[0]
 
@@ -1291,7 +1656,7 @@ def import_with_vision_9router(filepath: str, niner_key: str,
     except Exception:
         pass
 
-    # Bước 2: render pages → PIL
+    # Bước 2: render pages → PIL (giữ PDF tạm của DOCX tới cuối để đọc-bù lớp chữ)
     work_path = filepath
     tmp_pdf: Optional[str] = None
     if filepath.lower().endswith(('.docx', '.doc')):
@@ -1303,34 +1668,55 @@ def import_with_vision_9router(filepath: str, niner_key: str,
                 work_path = tmp_pdf
         except Exception:
             pass
+
+    def _cleanup():
+        if tmp_pdf and os.path.exists(tmp_pdf):
+            try: os.remove(tmp_pdf)
+            except Exception: pass
+
     page_images = _render_pdf_pages(work_path)
-    if tmp_pdf and os.path.exists(tmp_pdf):
-        try: os.remove(tmp_pdf)
-        except Exception: pass
     if not page_images:
+        _cleanup()
         if fallback_doc:
             return fallback_doc
         raise RuntimeError('Không render được file thành ảnh.')
+    pdf_is_text = work_path.lower().endswith('.pdf')
 
-    # Bước 3: chia cụm trang + gọi SONG SONG (giới hạn luồng)
-    batches = [page_images[i:i + P2W_VISION_BATCH]
-               for i in range(0, len(page_images), P2W_VISION_BATCH)]
-
-    def _do_batch(batch):
-        raw = _call_9router_vision_json(batch, niner_key, niner_url, model)
+    def _call(imgs, prompt=None):
+        raw = _call_9router_vision_json(imgs, niner_key, niner_url, model, prompt=prompt)
         data = _extract_and_parse_json(raw)
-        return (data or {}).get('sections') or []
+        secs = (data or {}).get('sections') or []
+        if not secs:
+            raise VisionBlocked('no-json')
+        return secs
 
-    section_lists: List[list] = []
+    def _regex_page(i, y_px=None):
+        if not pdf_is_text:
+            return []
+        y_range = None
+        if y_px is not None:
+            try:
+                import fitz
+                with fitz.open(work_path) as _d:
+                    ph = _d[i].rect.height
+                scale = page_images[i].size[1] / ph
+                y_range = (y_px[0] / scale, y_px[1] / scale)
+            except Exception:
+                y_range = None
+        return _pdf_pages_sections(work_path, [i], y_range=y_range)
+
+    notes: List[str] = []
+
+    # ── Lượt 1: cả đề ────────────────────────────────────────────
+    section_lists: Optional[List[list]] = None
+    doc_dedupe = ''
     try:
-        if len(batches) == 1:
-            section_lists = [_do_batch(batches[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=P2W_VISION_WORKERS) as ex:
-                section_lists = list(ex.map(_do_batch, batches))
+        section_lists = [_call(page_images)]
+    except VisionBlocked as e:
+        print(f'[9Router Vision] cả đề bị chặn ({e}) → đọc từng trang', flush=True)
     except Exception as e:
         print(f'[9Router Vision fallback] {e}', flush=True)
-        # Fallback: Gemini API trực tiếp (1 call) nếu có key
+        _cleanup()
         if gemini_key:
             try:
                 return import_with_vision(filepath, gemini_key)
@@ -1340,7 +1726,58 @@ def import_with_vision_9router(filepath: str, niner_key: str,
             return fallback_doc
         raise
 
-    merged_sections = _merge_vision_sections(section_lists)
+    # ── Lượt 2: từng trang → dải → lớp chữ ───────────────────────
+    if section_lists is None:
+        def _page(i):
+            img = page_images[i]
+            try:
+                return _call([_page_with_next(page_images, i)],
+                             prompt=_STRIP_HINT + VISION_JSON_PROMPT), 'ok'
+            except VisionBlocked:
+                pass
+            except Exception as e:
+                print(f'[9Router Vision] trang {i + 1} lỗi: {e}', flush=True)
+                return _regex_page(i), 'error'
+            strips = _page_strips(img, 3)
+            got: List[Optional[list]] = []
+            n_ok = 0
+            for (y0, y1, crop) in strips:
+                try:
+                    got.append(_call([crop], prompt=_STRIP_HINT + VISION_JSON_PROMPT))
+                    n_ok += 1
+                except Exception as e:      # VisionBlocked hoặc lỗi khác → lớp chữ vùng đó
+                    print(f'[9Router Vision] trang {i + 1} dải {y0}-{y1} bị chặn/lỗi: {e}', flush=True)
+                    got.append(None)
+            if n_ok == 0:
+                return _regex_page(i), 'blocked'
+            for k, (y0, y1, _) in enumerate(strips):
+                if got[k] is None:
+                    # vùng lớp chữ KHÔNG lấy phần chồng lấn (dải kế đã có)
+                    h = img.size[1]
+                    yy0 = 0 if k == 0 else int(k * h / 3)
+                    yy1 = h if k == len(strips) - 1 else int((k + 1) * h / 3)
+                    got[k] = _regex_page(i, (yy0, yy1))
+            page_secs = _merge_vision_sections(got, dedupe='any')
+            added = _fill_missing_from_regex(page_secs, _regex_page(i))
+            return page_secs, ('strips+' + ','.join(added)) if added else 'strips'
+
+        with ThreadPoolExecutor(max_workers=P2W_VISION_WORKERS) as ex:
+            results = list(ex.map(_page, range(len(page_images))))
+        section_lists = [secs for secs, _ in results]
+        doc_dedupe = 'last'
+        blocked = [i + 1 for i, (_, st) in enumerate(results) if st != 'ok']
+        empty = [i + 1 for i, (secs, st) in enumerate(results) if st != 'ok' and not secs]
+        if blocked:
+            msg = (f"AI Vision bị Google chặn ở trang {', '.join(map(str, blocked))} "
+                   "(bộ lọc 'trích dẫn nguyên văn' — nội dung đề trùng tài liệu phổ biến trên mạng). "
+                   "Đã đọc bù bằng lớp chữ của PDF: THẦY KIỂM TRA LẠI công thức/phương án các trang này.")
+            if empty:
+                msg += (f" Trang {', '.join(map(str, empty))} không có lớp chữ (bản scan) nên "
+                        "bị trống — hãy nhập lại riêng trang đó dạng ảnh.")
+            notes.append(msg)
+
+    _cleanup()
+    merged_sections = _merge_vision_sections(section_lists, dedupe=doc_dedupe)
     if not merged_sections:
         if gemini_key:
             try:
@@ -1352,12 +1789,15 @@ def import_with_vision_9router(filepath: str, niner_key: str,
         raise RuntimeError('9Router Vision không trả nội dung hợp lệ.')
 
     try:
-        return _json_to_document({'title': title, 'sections': merged_sections},
-                                 title, img_by_qnum, img_by_order, img_by_key=img_by_key)
+        doc = _json_to_document({'title': title, 'sections': merged_sections},
+                                title, img_by_qnum, img_by_order, img_by_key=img_by_key)
     except Exception:
         if fallback_doc:
             return fallback_doc
         raise
+    if notes:
+        doc.import_warning = ' '.join(notes)
+    return doc
 
 
 # ── Import ảnh trực tiếp → Gemini Vision → JSON ──────────────────

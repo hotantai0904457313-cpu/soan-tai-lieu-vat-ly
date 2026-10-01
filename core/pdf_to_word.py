@@ -30,9 +30,8 @@ MARKER_PY = VENV_MARKER / "Scripts" / "python.exe"
 MARKER_OUT = BASE_DIR / "data" / "marker_out"
 EXPORT_DIR = BASE_DIR / "data" / "exports"
 
-# Ngưỡng coi 1 trang là "có text": số ký tự tối thiểu
-_PAGE_TEXT_MIN_CHARS = 60
 # Tỉ lệ trang có text để coi cả tài liệu là "digital" -> tắt OCR
+# (ngưỡng ký tự/trang nay nằm trong core/pdf_scan.py — xem detect_text_layer)
 _DIGITAL_COVERAGE = 0.80
 
 
@@ -196,34 +195,35 @@ def stop_sidecar():
 
 # ── Nhận diện lớp text ────────────────────────────────────────────
 
-def detect_text_layer(pdf_path: str) -> dict:
-    """
-    Đếm tỉ lệ trang có lớp text thật.
-    Trả về {pages, pages_with_text, coverage, is_digital}.
-    Dùng PyMuPDF (fitz) — app chính đã cài sẵn.
-    """
-    try:
-        import fitz  # PyMuPDF
-    except Exception:
-        # Không có fitz -> không dám khẳđịnh -> coi như scan (an toàn: vẫn OCR)
-        return {"pages": 0, "pages_with_text": 0, "coverage": 0.0,
-                "is_digital": False, "note": "no_fitz"}
+_detect_cache: dict = {}        # (path, mtime, dải trang) → kết quả; 1 job gọi nhiều lần
 
-    doc = fitz.open(pdf_path)
-    n = doc.page_count
-    with_text = 0
-    for page in doc:
-        txt = (page.get_text("text") or "").strip()
-        if len(txt) >= _PAGE_TEXT_MIN_CHARS:
-            with_text += 1
-    doc.close()
-    coverage = (with_text / n) if n else 0.0
-    return {
-        "pages": n,
-        "pages_with_text": with_text,
-        "coverage": round(coverage, 3),
-        "is_digital": coverage >= _DIGITAL_COVERAGE,
-    }
+
+def detect_text_layer(pdf_path: str, page_indices: list | None = None) -> dict:
+    """
+    Đếm tỉ lệ trang có lớp text thật, và liệt kê trang nào là BẢN SCAN.
+    Trả về {pages, checked, pages_with_text, coverage, is_digital,
+            scan_pages, is_scan_doc, boilerplate}.
+
+    Uỷ quyền cho core/pdf_scan.analyze_pdf: cách đếm cũ (len(text) >= 60) bị
+    watermark dán ở lớp text qua mặt — PDF scan có watermark 63 ký tự/trang bị
+    coi là PDF chữ, OCR bị tắt và nội dung thật mất sạch.
+
+    Có cache theo (đường dẫn, mtime, dải trang): một lần convert gọi hàm này ở
+    vài chỗ, mà quét cả quyển sách vài trăm trang không rẻ.
+    """
+    from core.pdf_scan import analyze_pdf
+    try:
+        key = (str(pdf_path), os.path.getmtime(pdf_path),
+               tuple(page_indices) if page_indices is not None else None)
+    except Exception:
+        return analyze_pdf(pdf_path, page_indices=page_indices)
+    if key in _detect_cache:
+        return _detect_cache[key]
+    res = analyze_pdf(pdf_path, page_indices=page_indices)
+    if len(_detect_cache) > 8:
+        _detect_cache.clear()
+    _detect_cache[key] = res
+    return res
 
 
 # ── Các bước convert ──────────────────────────────────────────────
@@ -260,12 +260,30 @@ def _run_marker(pdf_path: Path, work_dir: Path, disable_ocr: bool,
     return max(md_files, key=lambda p: p.stat().st_mtime)
 
 
+_PAGE_MARKER_RE = r'(?m)^[ \t]*<!--\s*p2w:page=\d+\s*-->[ \t]*\n?'
+
+
+def _strip_page_markers(md_path: Path) -> Path:
+    """Xoá mốc trang <!-- p2w:page=N --> khỏi markdown trước khi dựng Word."""
+    import re as _re
+    raw = md_path.read_text(encoding="utf-8", errors="replace")
+    md_path.write_text(_re.sub(_PAGE_MARKER_RE, '', raw), encoding="utf-8")
+    return md_path
+
+
 def _run_pandoc(md_path: Path, out_docx: Path) -> Path:
     out_docx = out_docx.resolve()
     out_docx.parent.mkdir(parents=True, exist_ok=True)
     pandoc = find_pandoc()
     if not pandoc:
         raise RuntimeError("Chưa cài Pandoc")
+
+    # Xoá mốc trang <!-- p2w:page=N --> (dùng để gắn hình đúng trang) — Word
+    # không được thấy chúng.
+    try:
+        _strip_page_markers(md_path)
+    except Exception:
+        pass
 
     # Định dạng đề (CHOKEPOINT cho MỌI method odl/gemini/hybrid/marker):
     # tách đáp án A/B/C/D mỗi cái 1 dòng, Câu/Bài/PHẦN xuống dòng, xoá bullet,
@@ -339,6 +357,70 @@ def _ensure_odl_server(progress_cb=None) -> bool:
         if _odl_server_ready():
             return True
     return False
+
+
+def _strip_pdf_encryption(pdf_path: Path, progress_cb=None) -> Path:
+    """PDF có OWNER password (mở đọc không cần mật khẩu, chỉ khoá quyền in/copy —
+    rất phổ biến với đề tải trên mạng): PyMuPDF/pdfplumber mở bình thường nên app
+    không thấy gì lạ, nhưng PDFBox trong OpenDataLoader từ chối
+    ("Error: 'x.pdf' is password-protected") → Java thoát mã 1 → thầy thấy
+    "lỗi Java". Gỡ bằng cách lưu bản sao KHÔNG mã hoá vào MARKER_OUT rồi đưa bản
+    sao cho ODL. PDF đòi mật khẩu thật (user password) → báo lỗi rõ ràng."""
+    try:
+        import fitz
+    except ImportError:
+        return pdf_path
+    try:
+        doc = fitz.open(str(pdf_path))
+    except Exception:
+        return pdf_path  # để bước sau báo lỗi đúng ngữ cảnh
+    try:
+        if doc.needs_pass:
+            raise RuntimeError(
+                "PDF được đặt mật khẩu mở file. Hãy mở bằng mật khẩu, "
+                "lưu lại (Save As) bản không mật khẩu rồi chuyển lại.")
+        if not doc.metadata.get("encryption"):
+            return pdf_path
+        MARKER_OUT.mkdir(parents=True, exist_ok=True)
+        dec = MARKER_OUT / (_safe_stem(pdf_path.name) + "_giai_ma.pdf")
+        doc.save(str(dec), encryption=fitz.PDF_ENCRYPT_NONE)
+        if progress_cb:
+            try:
+                progress_cb("detect", "PDF có mã hoá (khoá quyền) — đã gỡ để OpenDataLoader đọc được")
+            except Exception:
+                pass
+        return dec
+    finally:
+        doc.close()
+
+
+def _run_odl(kwargs: dict) -> None:
+    """Gọi opendataloader_pdf.convert và đổi lỗi Java thành thông báo đọc được.
+    Runner của ODL chỉ raise CalledProcessError ("Command ['java', ...] returned
+    non-zero exit status 1") — thông báo thật ODL in ra STDOUT (vd
+    "is password-protected"), dưới pythonw không ai thấy. Lấy lại đuôi output."""
+    import opendataloader_pdf
+    try:
+        opendataloader_pdf.convert(**kwargs)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "Không tìm thấy lệnh 'java'. Cài Java 21 (Temurin) tại https://adoptium.net") from e
+    except subprocess.CalledProcessError as e:
+        out = ((e.stdout or "") + "\n" + (e.stderr or "")).strip()
+        tail = out[-600:] if out else f"exit {e.returncode}"
+        raise RuntimeError(f"OpenDataLoader (Java) lỗi: {tail}") from e
+
+
+def _strip_rule_lines(md_path: Path) -> Path:
+    """Bỏ dòng kẻ ngang header/footer (____) lọt vào khi bật include_header_footer."""
+    import re as _re
+    try:
+        t = md_path.read_text(encoding="utf-8", errors="replace")
+        t = _re.sub(r'(?m)^[ \t]*_{5,}[ \t]*$\n?', '', t)
+        md_path.write_text(t, encoding="utf-8")
+    except Exception:
+        pass
+    return md_path
 
 
 def _merge_md_files(work_dir: Path) -> Path:
@@ -586,21 +668,27 @@ def _strip_answer_bullets(md_path: Path) -> Path:
     return md_path
 
 
+def _meaningful_text_len(content: str) -> int:
+    """
+    So ky tu CHU thuc su trong 1 doan Markdown (bo thẻ ảnh, bỏ ký hiệu markdown).
+    Dung de phan dinh "trang nay rong" — trang scan ma ODL xu ly chi ra anh trang.
+    """
+    import re
+    text = re.sub(r'!\[[^\]]*\]\(<[^>]*>\)', '', content or '')
+    text = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text)
+    text = re.sub(r'<!--[\s\S]*?-->', '', text)          # mốc trang p2w:page=N
+    text = re.sub(r'^---+$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'[#*_`\-=|>]', '', text)
+    return len(text.strip())
+
+
 def _has_meaningful_text(md_path: Path) -> bool:
     """
     Kiem tra Markdown co chua text thuc su khong (khong chi toan anh).
     ODL convert scan PDF se chi ra anh trang, khong co text → can fallback.
     """
-    import re
-    content = md_path.read_text(encoding="utf-8", errors="replace")
-    # Xoa tat ca image refs (ca 2 dang: ![](path) va ![](<path>))
-    text = re.sub(r'!\[[^\]]*\]\(<[^>]*>\)', '', content)
-    text = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text)
-    # Xoa markdown syntax, dau phan cach ---
-    text = re.sub(r'^---+$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'[#*_`\-=|>]', '', text)
-    # Neu con hon 50 ky tu thuc su → co text
-    return len(text.strip()) > 50
+    return _meaningful_text_len(
+        md_path.read_text(encoding="utf-8", errors="replace")) > 50
 
 
 def _parse_page_range(page_range: str, total_pages: int) -> list:
@@ -826,10 +914,25 @@ def _replace_tables_with_images(pdf_path: Path, work_dir: Path, md_path: Path,
                     # Bảng câu hỏi Đúng-Sai → giữ TEXT; None giữ chỗ cho đúng cặp
                     table_refs.append(None)
                     continue
+                try:
+                    from core.pdf_word_figures import is_figure_like_table
+                    if is_figure_like_table(t):
+                        # Đồ thị có lưới ô vuông bị find_tables tưởng là bảng → KHÔNG
+                        # phải bảng: bước gắn hình (pdf_word_figures) sẽ cắt và neo vào
+                        # câu. Không đưa vào table_refs (ODL không xuất block cho nó;
+                        # nếu có thì block toàn ô trống bị bỏ ở vòng dưới) để cặp thứ tự
+                        # bảng↔block của các bảng THẬT không lệch.
+                        continue
+                except Exception:
+                    pass
                 clip = fitz.Rect(t.bbox)
                 # Nới nhẹ biên để không cắt cụt viền/chữ
                 clip = fitz.Rect(clip.x0 - 3, clip.y0 - 3, clip.x1 + 3, clip.y1 + 3)
                 pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+                try:
+                    pix.set_dpi(144, 144)   # zoom 2 → 144 DPI: Word hiện đúng cỡ gốc
+                except Exception:
+                    pass
                 name = f"p{pidx+1}_table{len(table_refs)+1}.png"
                 pix.save(str(fig_dir / name))
                 table_refs.append(f"figures/{name}")
@@ -841,7 +944,7 @@ def _replace_tables_with_images(pdf_path: Path, work_dir: Path, md_path: Path,
         return md_path
     if progress_cb:
         n_img = sum(1 for r in table_refs if r)
-        n_ds = len(table_refs) - n_img
+        n_ds = sum(1 for r in table_refs if r is None)
         progress_cb("table", f"Đã phát hiện {len(table_refs)} bảng → {n_img} thành ảnh, "
                              f"{n_ds} bảng Đúng-Sai giữ text…")
 
@@ -849,6 +952,21 @@ def _replace_tables_with_images(pdf_path: Path, work_dir: Path, md_path: Path,
     content = md_path.read_text(encoding="utf-8", errors="replace")
     lines = content.split("\n")
     is_tbl = lambda s: bool(_re.match(r'^\s*\|.*\|\s*$', s))
+
+    def _is_empty_grid_block(block) -> bool:
+        """Block bảng markdown ≥ 12 ô mà ≤ 25 % ô có chữ = ODL xuất lưới đồ thị
+        thành bảng → bỏ (hình do bước gắn hình chèn), không tiêu thụ ref bảng thật."""
+        cells = filled = 0
+        for ln in block:
+            s = ln.strip().strip('|')
+            if _re.match(r'^[\s|:\-]*$', s):
+                continue
+            for c in s.split('|'):
+                cells += 1
+                if c.strip():
+                    filled += 1
+        return cells >= 12 and filled <= 0.25 * cells
+
     out, i, used = [], 0, 0
     while i < len(lines):
         if is_tbl(lines[i]):
@@ -857,6 +975,9 @@ def _replace_tables_with_images(pdf_path: Path, work_dir: Path, md_path: Path,
                 j += 1
             if (j - i) >= 2:   # >=2 dòng mới coi là bảng
                 block = lines[i:j]
+                if _is_empty_grid_block(block):
+                    i = j
+                    continue
                 ref = table_refs[used] if used < len(table_refs) else False
                 if (used < len(table_refs) and ref is None) or _is_ds_md_block(block):
                     # Bảng Đúng-Sai → các dòng nhận định (text), không ảnh
@@ -910,15 +1031,19 @@ def _convert_via_odl(pdf_path: Path, work_dir: Path,
         hybrid_mode="auto",
         hybrid_fallback=True,
         quiet=True,
+        # BẮT BUỘC (10/09/2026): mặc định ODL tự bỏ header/footer lặp và khi chạy
+        # ≥ 2 trang nó NUỐT LUÔN đoạn đầu trang nằm sát header (mất cả câu dẫn
+        # "Câu 14: …" của Đề 4). Giữ header/footer rồi tự lọc dòng kẻ ____ ở dưới.
+        include_header_footer=True,
     )
     if page_range:
         odl_kwargs["pages"] = page_range  # ODL nhan "1-3" hoac "1,2,5"
-    opendataloader_pdf.convert(**odl_kwargs)
+    _run_odl(odl_kwargs)
 
     # Merge tất cả .md thành một file duy nhất
     if progress_cb:
         progress_cb("odl", "Gộp các trang Markdown…")
-    md = _merge_md_files(work_dir)
+    md = _strip_rule_lines(_merge_md_files(work_dir))
 
     # Xoa anh nguyen trang, chuyen bang -> anh, xoa bullet, to dam.
     # KHONG goi AI sua cong thuc (cham + thuong vo ich voi de chu yeu la chu).
@@ -988,6 +1113,75 @@ _GEMINI_PROMPT = (
 )
 
 
+# Prompt riêng cho TRANG SCAN (ảnh chụp). Khác _GEMINI_PROMPT ở mấy điểm sống còn:
+#   - nói rõ đây là bản scan, nhiệm vụ số một là ĐỌC ĐỦ (prompt digital không hề
+#     nhắc tới scan, cũng không có lệnh đọc đủ)
+#   - BỎ "số câu phải liên tục 1,2,3,4": sách scan hay bắt đầu giữa câu, lệnh đó
+#     khiến model tự đánh số lại và bỏ phần lẻ đầu/cuối trang
+#   - BỎ ép đọc 2 cột: sách scan thường 1 cột, ép 2 cột làm model đọc ngang
+#   - Bảng số liệu → BẢNG MARKDOWN (không phải {{FIGURE}}): trên trang scan bbox
+#     hay lệch, mà placeholder không cắt được thì mất nguyên bảng
+#   - nén vi-quy-tắc LaTeX lại cho gọn để model dồn sức vào việc đọc đủ
+#   - bắt buộc anchor_text để neo hình: trang scan không có lớp text để so khớp
+_SCAN_PROMPT = (
+    "Đây là ẢNH CHỤP/BẢN SCAN một trang sách hoặc đề thi Vật lí THPT Việt Nam.\n"
+    "Chữ có thể mờ, lệch, dính nhau.\n\n"
+    "NHIỆM VỤ SỐ MỘT: ĐỌC TOÀN BỘ chữ trên trang, KHÔNG BỎ SÓT dòng nào.\n"
+    "Thà đọc hơi sai một từ còn hơn bỏ qua cả một ý. Trước khi trả lời, hãy tự\n"
+    "quét lại từ mép trên xuống mép dưới xem còn dòng nào chưa ghi không.\n\n"
+    "Trả về JSON THUẦN (không có ```json``` code block) theo đúng format:\n"
+    "{\n"
+    '  "markdown": "...",\n'
+    '  "figures": [\n'
+    '    {"id": 1, "bbox": [x1_pct, y1_pct, x2_pct, y2_pct], '
+    '"anchor_text": "...", "caption": "..."}\n'
+    "  ]\n"
+    "}\n\n"
+    "QUY TẮC ĐỌC\n"
+    "1. Đọc theo đúng thứ tự mắt đọc. Tự nhận ra trang 1 cột hay 2 cột: CHỈ KHI "
+    "thấy rõ hai khối chữ song song mới đọc hết cột trái rồi sang cột phải. "
+    "Sách thường là 1 cột — đừng tự chẻ thành 2 cột.\n"
+    "2. GIỮ NGUYÊN số thứ tự IN TRÊN TRANG (Câu 37, Bài 12, Ví dụ 3, ý a), b)...). "
+    "TUYỆT ĐỐI KHÔNG đánh số lại từ 1, KHÔNG sắp xếp lại.\n"
+    "3. Trang bắt đầu hoặc kết thúc GIỮA một câu là bình thường: cứ ghi đúng phần "
+    "nhìn thấy, không bịa thêm, không bỏ phần lẻ đó đi.\n"
+    "4. BỎ: watermark, tên website, header/footer lặp, số trang.\n"
+    "5. Giữ nguyên tiếng Việt có dấu. Tự sửa lỗi OCR hiển nhiên (chữ dính, thiếu "
+    "dấu) nhưng KHÔNG đổi số liệu, KHÔNG đổi đơn vị.\n\n"
+    "ĐỊNH DẠNG\n"
+    "6. Số câu: **Câu 37.** — Phương án: **A.** mỗi phương án 1 dòng, đúng thứ tự "
+    "A→B→C→D — Ý đúng/sai: **a)** mỗi ý 1 dòng.\n"
+    "7. Tiêu đề bài/mục → heading Markdown (##, ###).\n"
+    "8. BẢNG SỐ LIỆU → viết thành BẢNG MARKDOWN chuẩn (| ... | và |---|). "
+    "KHÔNG biến bảng thành hình.\n\n"
+    "CÔNG THỨC (ngắn gọn, bắt buộc)\n"
+    "9. Công thức → $...$; phân số → $\\dfrac{a}{b}$ hoặc giữ dấu '/', TUYỆT ĐỐI "
+    "KHÔNG tách tử-mẫu thành 'π 4'.\n"
+    "10. Số mũ của 10: $1,5.10^{6}$, $3.10^{-6}$ — dấu CHẤM nhân, thập phân dấu "
+    "PHẨY trần. KHÔNG viết liền '106', '10-6'.\n"
+    "11. Đơn vị trong công thức bọc \\text{}, mũ NGOÀI: $10\\text{m/s}^2$, "
+    "$25^\\circ\\text{C}$, $45^\\circ$, $V = 3,3.10^{-3}\\text{m}^3$, lít viết "
+    "$2\\text{l}$. Số + đơn vị ĐƠN GIẢN (20N, 1,5J) để text thường, KHÔNG bọc $.\n"
+    "12. Dấu $ LUÔN ĐỦ CẶP; cả biểu thức so sánh nằm trong MỘT cặp: $T_1 > T_0$.\n\n"
+    "HÌNH VẼ\n"
+    "13. Mỗi hình vẽ / đồ thị / sơ đồ mạch → đặt {{FIGURE_1}}, {{FIGURE_2}}... đúng "
+    "chỗ trong markdown và khai trong \"figures\".\n"
+    "14. bbox: [left%, top%, right%, bottom%] theo % chiều rộng/cao trang (0.0–100.0).\n"
+    "15. anchor_text = NGUYÊN VĂN 6–12 từ đầu của dòng chữ ngay TRÊN (hoặc bên cạnh) "
+    "hình đó — dùng để đặt hình vào đúng chỗ. BẮT BUỘC có.\n"
+    "16. KHÔNG khai: bảng số liệu, công thức rời, logo, số trang, watermark, ô kẻ "
+    "trống để điền đáp án (thay bằng dòng '**Điền đáp án:**').\n"
+    "17. Trang không có hình → figures: []"
+)
+
+# Nhắc khi chỉ gửi MỘT PHẦN của trang (đọc lại theo nửa trang khi bị cắt giữa đường)
+_SCAN_STRIP_HINT = (
+    "LƯU Ý: ảnh này chỉ là MỘT PHẦN của trang. Câu/ý nào bị cắt cụt ở mép trên "
+    "hoặc mép dưới ảnh thì BỎ QUA, phần kia của trang đã có. Chỉ ghi những gì "
+    "nhìn thấy trọn vẹn.\n\n"
+)
+
+
 def _render_page_png(doc, idx: int, zoom: int = 2):
     """Render 1 trang PDF → (png_bytes, width, height). Gọi ở luồng chính
     (fitz KHÔNG an toàn đa luồng) rồi truyền bytes cho các luồng Gemini."""
@@ -995,6 +1189,61 @@ def _render_page_png(doc, idx: int, zoom: int = 2):
     page = doc[idx]
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
     return pix.tobytes("png"), pix.width, pix.height
+
+
+class VisionBlocked(RuntimeError):
+    """Gemini trả RỖNG vì bộ lọc Google (finish_reason 'recitation': trang đề trùng nguyên
+    văn tài liệu phổ biến trên mạng, hoặc safety). Không phải lỗi mạng — retry/đổi model
+    Gemini đều bị chặn y hệt → caller phải lùi sang ODL (lớp chữ) cho trang đó."""
+
+
+class VisionTruncated(RuntimeError):
+    """Model đọc trang chưa xong đã hết hạn mức output (finish_reason 'length' /
+    MAX_TOKENS). Mang theo phần text đã nhận ở .partial để caller đọc lại trang
+    theo từng nửa. Trước đây trường hợp này bị coi là kết quả hợp lệ → mất nửa
+    cuối trang mà không ai biết."""
+
+    def __init__(self, partial: str = ""):
+        super().__init__("Model bị cắt giữa đường (hết hạn mức output)")
+        self.partial = partial or ""
+
+
+class PageLost(RuntimeError):
+    """ODL không lấy được chữ nào cho dải trang này (trang scan: thứ duy nhất ODL
+    xuất ra là ảnh nguyên trang, mà ảnh đó bị _remove_page_images xoá). Phải raise
+    để caller biết mà lùi sang Vision — trước đây hàm trả chuỗi rỗng im lặng."""
+
+
+_BLOCK_REASONS = ('recitation', 'content_filter', 'safety', 'blocklist', 'prohibited_content')
+
+# Hạn mức output cho Vision. Model ag/ là loại "thinking" (phần suy nghĩ cũng ăn
+# hạn mức) nên phải để rộng; trang scan dày chữ trước đây bị cắt âm thầm.
+_VISION_MAX_TOKENS = 16000              # nhánh 9Router (bằng core/importer.py)
+_VISION_MAX_OUTPUT_GEMINI = 32768       # nhánh Gemini API trực tiếp
+
+# Đường dự phòng bằng key Gemini trực tiếp của thầy, thử lần lượt.
+# Đã kiểm 01/10/2026: key truy cập được cả 2 model này.
+_GEMINI_DIRECT_MODELS = ("gemini-3.5-flash", "gemini-2.5-flash")
+
+
+def _resp_text(resp) -> str:
+    """Lấy text từ response Gemini. resp.text ném lỗi khi candidate không có part
+    (bị chặn, hoặc cắt ngay từ token đầu) → phải tự gom part."""
+    try:
+        return resp.text or ""
+    except Exception:
+        pass
+    try:
+        out = []
+        for cand in (getattr(resp, "candidates", None) or []):
+            content = getattr(cand, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                t = getattr(part, "text", "")
+                if t:
+                    out.append(t)
+        return "".join(out)
+    except Exception:
+        return ""
 
 
 def _vision_call(model: str, img_bytes: bytes, prompt: str,
@@ -1005,6 +1254,8 @@ def _vision_call(model: str, img_bytes: bytes, prompt: str,
       - model có '/' (vd ag/gemini-3.7-flash-low) → gọi 9Router (OpenAI-compatible, ảnh base64).
       - model không '/' (vd gemini-2.5-flash) → gọi Gemini API trực tiếp.
     Fallback: 9Router lỗi + có Gemini key → thử gemini-2.5-flash trực tiếp.
+    Trả rỗng / finish_reason recitation → VisionBlocked ngay (trước đây trả "" im lặng
+    → trang mất trắng trong Word; và fallback Gemini trực tiếp cũng bị chặn y hệt).
     """
     import time as _t
     import re as _re
@@ -1023,19 +1274,45 @@ def _vision_call(model: str, img_bytes: bytes, prompt: str,
                 resp = client.chat.completions.create(
                     model=model,
                     temperature=0.1,
+                    max_tokens=_VISION_MAX_TOKENS,
                     messages=[{"role": "user", "content": [
                         {"type": "text", "text": prompt},
                         {"type": "image_url",
                          "image_url": {"url": f"data:image/png;base64,{b64}"}}]}])
-                return (resp.choices[0].message.content or "").strip()
+                ch = resp.choices[0]
+                text = (ch.message.content or "").strip()
+                reason = (getattr(ch, "finish_reason", "") or "").lower()
+                if reason in _BLOCK_REASONS or not text:
+                    raise VisionBlocked(f"Gemini bị Google chặn ({reason or 'rỗng'})")
+                if reason == "length":
+                    # Bị cắt giữa đường: trước đây vẫn coi là hợp lệ → mất nửa
+                    # cuối trang mà không ai biết. Mang theo phần đã đọc để
+                    # người gọi đọc lại theo nửa trang.
+                    raise VisionTruncated(text)
+                return text
             else:
                 import google.generativeai as genai
                 genai.configure(api_key=gemini_api_key)
                 gm = genai.GenerativeModel(model)
                 resp = gm.generate_content(
                     [{"mime_type": "image/png", "data": img_bytes}, prompt],
-                    generation_config={"response_mime_type": "application/json"})
-                return (resp.text or "").strip()
+                    generation_config={"response_mime_type": "application/json",
+                                       "max_output_tokens": _VISION_MAX_OUTPUT_GEMINI,
+                                       "temperature": 0.1})
+                cand = resp.candidates[0] if getattr(resp, "candidates", None) else None
+                fr = getattr(cand, "finish_reason", None)
+                fr_name = str(getattr(fr, "name", fr) or "").upper()
+                if fr_name in ("RECITATION", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT") or fr == 4:
+                    raise VisionBlocked(f"Gemini bị Google chặn ({fr_name})")
+                text = (_resp_text(resp) or "").strip()
+                if not text:
+                    # Trước đây return "" im lặng ở đây → trang mất trắng
+                    raise VisionBlocked(f"Gemini trả rỗng ({fr_name or 'không rõ'})")
+                if fr_name == "MAX_TOKENS":
+                    raise VisionTruncated(text)
+                return text
+        except VisionBlocked:
+            raise
         except Exception as e:
             last = e
             msg = str(e)
@@ -1047,26 +1324,36 @@ def _vision_call(model: str, img_bytes: bytes, prompt: str,
                 _t.sleep(min(wait + 0.5, 30))
                 continue
             break
-    # Fallback: 9Router hỏng nhưng có Gemini key → dùng gemini-2.5-flash trực tiếp
+    # Fallback: 9Router hỏng nhưng có Gemini key → dùng key trực tiếp của thầy.
+    # Thử lần lượt vài model (key truy cập được cả gemini-3.5-flash, mạnh hơn
+    # gemini-2.5-flash vốn hard-code ở đây), và kiểm finish_reason đàng hoàng
+    # thay vì nhận "" âm thầm.
     if is_router and gemini_api_key:
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=gemini_api_key)
-            gm = genai.GenerativeModel("gemini-2.5-flash")
-            resp = gm.generate_content(
-                [{"mime_type": "image/png", "data": img_bytes}, prompt])
-            return (resp.text or "").strip()
-        except Exception as e:
-            last = e
+        for fb_model in _GEMINI_DIRECT_MODELS:
+            try:
+                return _vision_call(fb_model, img_bytes, prompt,
+                                    gemini_api_key=gemini_api_key,
+                                    max_retries=1)
+            except VisionTruncated:
+                raise
+            except Exception as e:
+                last = e
+                continue
     raise last if last else RuntimeError("Vision call lỗi không rõ")
 
 
 def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
                      fig_dir: Path, model: str = "ag/gemini-3.7-flash-low",
                      niner_url: str = "", niner_key: str = "",
-                     gemini_api_key: str = "") -> str:
+                     gemini_api_key: str = "", scan: bool = False,
+                     prompt_extra: str = "") -> str:
     """Xử lý 1 trang qua Vision (9Router hoặc Gemini trực tiếp) → markdown
-    (đã cắt figures/bảng theo bbox). THUẦN (không fitz) → an toàn đa luồng."""
+    (đã cắt figures/bảng theo bbox). THUẦN (không fitz) → an toàn đa luồng.
+
+    scan=True → dùng _SCAN_PROMPT (bản scan: đọc đủ, giữ số in trên trang, bảng
+    thành Markdown) thay vì _GEMINI_PROMPT (trang digital phức tạp).
+    prompt_extra → thêm vào đầu prompt (dùng khi chỉ gửi một nửa trang).
+    """
     import json as _json
     import re as _re
     import io as _io
@@ -1076,7 +1363,8 @@ def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
     except ImportError:
         _pil_ok = False
 
-    raw = _vision_call(model, img_bytes, _GEMINI_PROMPT,
+    prompt = (prompt_extra or "") + (_SCAN_PROMPT if scan else _GEMINI_PROMPT)
+    raw = _vision_call(model, img_bytes, prompt,
                        niner_url=niner_url, niner_key=niner_key,
                        gemini_api_key=gemini_api_key)
 
@@ -1135,6 +1423,7 @@ def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
         for _suf in _sufs:
             md_text = md_text.replace(_ctrl + _suf, '\\' + _CTRL2ESC[_ctrl] + _suf)
 
+    placed_boxes = []   # bbox (%) các hình ĐÃ chèn — để pdf_word_figures không cắt trùng
     for fig in figures:
         local_id = fig.get("id")
         try:
@@ -1144,31 +1433,105 @@ def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
                 y1 = max(0, int(bbox[1] / 100 * page_h))
                 x2 = min(page_w, int(bbox[2] / 100 * page_w))
                 y2 = min(page_h, int(bbox[3] / 100 * page_h))
-                if (x2 - x1) > 30 and (y2 - y1) > 30:
+                placeholder = f"{{{{FIGURE_{local_id}}}}}"
+                if (x2 - x1) > 30 and (y2 - y1) > 30 and placeholder in md_text:
                     img = PILImage.open(_io.BytesIO(img_bytes))
                     crop = img.crop((x1, y1, x2, y2))
                     fig_name = f"p{idx+1}_fig{local_id}.png"
-                    crop.save(fig_dir / fig_name, "PNG")
+                    # Trang render zoom 2 → 144 DPI: ghi vào PNG để Pandoc dựng đúng
+                    # cỡ gốc (không ghi → Pandoc coi 96 DPI → hình to gấp 1,5 lần)
+                    crop.save(fig_dir / fig_name, "PNG", dpi=(144, 144))
                     caption = fig.get("caption", f"Hình {local_id}")
                     md_text = md_text.replace(
-                        f"{{{{FIGURE_{local_id}}}}}",
+                        placeholder,
                         f"\n\n![{caption}](figures/{fig_name})\n\n")
+                    placed_boxes.append({"id": local_id, "bbox": [float(v) for v in bbox]})
         except Exception:
             pass
+    try:
+        (fig_dir / f"p{idx+1}_gemini_boxes.json").write_text(
+            _json.dumps(placed_boxes), encoding="utf-8")
+    except Exception:
+        pass
 
-    md_text = _re.sub(r'\{\{FIGURE_\d+\}\}', '', md_text)
+    # Placeholder còn sót (bbox lệch / quá nhỏ / thiếu PIL): KHÔNG xoá trắng như
+    # trước — để lại chú thích để thầy biết chỗ đó vốn có hình, nhất là khi
+    # Gemini đã khai cả một BẢNG SỐ LIỆU thành hình.
+    _caps = {}
+    for fig in (figures or []):
+        try:
+            _caps[int(fig.get("id", 0))] = (fig.get("caption") or "").strip()
+        except Exception:
+            continue
+
+    def _leftover(m):
+        cap = _caps.get(int(m.group(1)), "")
+        return f"\n\n*[Hình: {cap}]*\n\n" if cap else "\n\n*[Hình trong trang gốc]*\n\n"
+
+    md_text = _re.sub(r'\{\{FIGURE_(\d+)\}\}', _leftover, md_text)
     return md_text.strip()
+
+
+def _png_halves(img_bytes: bytes, overlap: float = 0.15) -> list:
+    """Chia ảnh trang thành nửa trên / nửa dưới CÓ CHỒNG LẤN (mặc định 15%).
+
+    Dùng khi model đọc chưa xong trang đã hết hạn mức output: gửi lại từng nửa
+    thì mỗi lần ít chữ hơn nên đọc trọn. Chồng lấn để câu nằm đúng chỗ cắt không
+    bị mất ở cả hai nửa (cùng ý với _page_strips của core/importer.py, nhưng để
+    riêng ở đây — import chéo sẽ kéo cả state của luồng nhập đề).
+    """
+    try:
+        import io as _io
+        from PIL import Image as PILImage
+    except ImportError:
+        return []
+    try:
+        with PILImage.open(_io.BytesIO(img_bytes)) as im:
+            im.load()
+            w, h = im.size
+            cut_lo = int(h * (0.5 + overlap))
+            cut_hi = int(h * (0.5 - overlap))
+            out = []
+            for box in ((0, 0, w, cut_lo), (0, cut_hi, w, h)):
+                buf = _io.BytesIO()
+                im.crop(box).save(buf, "PNG")
+                out.append(buf.getvalue())
+            return out
+    except Exception:
+        return []
+
+
+def _looks_truncated(md: str) -> bool:
+    """Phỏng đoán markdown của 1 trang bị cắt giữa đường (model hết hạn mức mà
+    API không báo). Chỉ dùng để QUYẾT ĐỊNH ĐỌC LẠI — đọc lại thừa thì chỉ tốn
+    thêm thời gian, còn bỏ sót thì mất chữ."""
+    import re as _re
+    s = (md or "").strip()
+    if not s:
+        return False
+    if s.count("$") % 2 == 1:            # công thức hở một dấu $ → cắt giữa công thức
+        return True
+    last = s.splitlines()[-1].strip()
+    if not last:
+        return False
+    # Dòng cuối là một phương án / ý / tiêu đề hoàn chỉnh → coi như bình thường
+    if _re.match(r'^(\*\*)?([A-Da-d][.)]|Câu|Bài|#|\||\*|-|\d+[.)])', last):
+        return False
+    if last[-1] in '.?!:)]"”…|':
+        return False
+    return len(last) > 40                # câu dài mà không có dấu kết thúc
 
 
 def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
                         model: str = "ag/gemini-3.7-flash-low",
                         page_range: str | None = None,
                         niner_url: str = "", niner_key: str = "",
-                        progress_cb=None) -> Path:
+                        progress_cb=None) -> tuple:
     """
     Dùng Vision đọc PDF → Markdown+LaTeX, CHẠY SONG SONG các trang
     (ThreadPoolExecutor) + cắt hình/bảng theo bbox. Model mặc định Gemini 3 Flash
     qua 9Router (mạnh hơn 2.5); fallback Gemini API trực tiếp.
+    Trả về (md_path, stats) — stats có failed_pages/truncated_pages/scan_pages.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -1191,33 +1554,84 @@ def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
     doc = fitz.open(str(pdf_path))
     n = doc.page_count
     page_indices = _parse_page_range(page_range, n) if page_range else list(range(n))
-    # Render PNG ở luồng chính (fitz không an toàn đa luồng)
-    png_map = {idx: _render_page_png(doc, idx) for idx in page_indices}
+    detect = detect_text_layer(str(pdf_path), page_indices=page_indices)
+    scan_set = set(detect.get("scan_pages") or ())
+    # Render PNG ở luồng chính (fitz không an toàn đa luồng).
+    # Trang scan zoom 3 (216 DPI) — đo thực tế +38% chữ đọc được so với zoom 2.
+    png_map = {idx: _render_page_png(doc, idx, zoom=(3 if idx in scan_set else 2))
+               for idx in page_indices}
     doc.close()
 
     results, done = {}, [0]
+    failed_pages, truncated_pages = [], []
 
     def _work(idx):
         b, w, h = png_map[idx]
+        is_scan = idx in scan_set
+        md, why = "", ""
         try:
             md = _gemini_one_page(b, w, h, idx, fig_dir, model=model,
                                   niner_url=niner_url, niner_key=niner_key,
-                                  gemini_api_key=api_key)
+                                  gemini_api_key=api_key, scan=is_scan)
+            if _looks_truncated(md):
+                better = _read_halves_gemini(idx, b, w, h, is_scan)
+                if _meaningful_text_len(better) > _meaningful_text_len(md):
+                    md = better
+        except VisionTruncated as e:
+            truncated_pages.append(idx + 1)
+            md = _read_halves_gemini(idx, b, w, h, is_scan)
+            if _meaningful_text_len(md) < _meaningful_text_len(e.partial):
+                md = e.partial
+            why = "hết hạn mức output"
         except Exception as e:
-            md = f"[Lỗi đọc trang {idx+1}: {str(e)[:120]}]"
+            why = str(e)[:120]
+            if api_key:
+                for fb in _GEMINI_DIRECT_MODELS:
+                    try:
+                        md = _gemini_one_page(b, w, h, idx, fig_dir, model=fb,
+                                              gemini_api_key=api_key, scan=is_scan)
+                        why = ""
+                        break
+                    except Exception as e2:
+                        why = str(e2)[:120]
+                        continue
+        if _meaningful_text_len(md) <= 40:
+            md = _page_failure_marker(idx, why or "không đọc được chữ",
+                                      fig_dir, pdf_path, md)
+            failed_pages.append(idx + 1)
         done[0] += 1
         _emit("gemini", f"Vision đọc trang {done[0]}/{len(page_indices)}…")
         return idx, md
+
+    def _read_halves_gemini(idx, b, w, h, is_scan):
+        halves = _png_halves(b)
+        parts = []
+        for hb in halves:
+            try:
+                parts.append(_gemini_one_page(
+                    hb, w, h // 2, idx, fig_dir, model=model,
+                    niner_url=niner_url, niner_key=niner_key,
+                    gemini_api_key=api_key, scan=is_scan,
+                    prompt_extra=_SCAN_STRIP_HINT))
+            except Exception:
+                continue
+        return "\n\n".join(p for p in parts if p).strip()
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         for fut in as_completed([ex.submit(_work, i) for i in page_indices]):
             idx, md = fut.result()
             results[idx] = md
 
-    pages_md = [results.get(i, "") for i in page_indices]
+    pages_md = [f"<!-- p2w:page={i+1} -->\n{results.get(i, '')}" for i in page_indices]
     md_path = work_dir / (pdf_path.stem + ".md")
     md_path.write_text("\n\n---\n\n".join(pages_md), encoding="utf-8")
-    return md_path
+    stats = {
+        "failed_pages": sorted(set(failed_pages)),
+        "truncated_pages": sorted(set(truncated_pages)),
+        "scan_pages": sorted(p + 1 for p in scan_set),
+        "ocr_used": True,
+    }
+    return md_path, stats
 
 
 # ── PDF → Markdown SẠCH cho NotebookLM (OCR Gemini, không cắt hình) ──
@@ -1351,26 +1765,36 @@ _MATH_DENSITY_CHARS = ('√∫∑∂∇±×÷≥≤≠≈→⃗'
                        '₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹^_')
 
 
-def _classify_pages(pdf_path: Path, page_indices: list) -> set:
+_DRAW_THRESHOLD = 40     # số nét vẽ vector → sơ đồ/đồ thị (ODL không trích được)
+_MATH_THRESHOLD = 8      # số ký hiệu toán/trang → công thức (ODL hay rớt "/" phân số)
+_FRAC_THRESHOLD = 2      # số phân số (π/4, a/b, số/số) → ODL mất dấu "/" → Gemini
+
+
+def _classify_pages(pdf_path: Path, page_indices: list,
+                    scan_set: set | None = None) -> set:
     """
-    Trả về set các trang PHỨC TẠP (cần Gemini): có bảng, ảnh/sơ đồ đáng kể,
-    nhiều đồ hoạ vector, hoặc mật độ công thức cao. Còn lại = trang chữ (ODL).
-    Ngưỡng để dễ tinh chỉnh.
+    Trả về set các trang PHỨC TẠP (cần Gemini): là bản scan, có bảng, ảnh/sơ đồ
+    đáng kể, nhiều đồ hoạ vector, hoặc mật độ công thức cao. Còn lại = trang chữ (ODL).
+
+    scan_set: các trang đã được core/pdf_scan xác định là bản scan — luôn được
+    THÊM vào kết quả. Việc nhận diện scan nằm hẳn ở đó (chống watermark), không
+    còn làm bằng ngưỡng "ít chữ + có ảnh" ngay trong hàm này nữa.
     """
     try:
         import fitz
     except Exception:
-        return set()
-    DRAW_THRESHOLD = 40      # số nét vẽ vector → sơ đồ/đồ thị (ODL không trích được)
-    MATH_THRESHOLD = 8       # số ký hiệu toán/trang → công thức (ODL hay rớt "/" phân số)
-    FRAC_THRESHOLD = 2       # số phân số (π/4, a/b, số/số) → ODL mất dấu "/" → Gemini
-    SCAN_TEXT_MIN = 50       # < ngưỡng này + có ảnh → trang scan (cần OCR)
-    complex_set = set()
+        return set(scan_set or ())
+    DRAW_THRESHOLD = _DRAW_THRESHOLD
+    MATH_THRESHOLD = _MATH_THRESHOLD
+    FRAC_THRESHOLD = _FRAC_THRESHOLD
+    complex_set = set(scan_set or ())
     try:
         doc = fitz.open(str(pdf_path))
     except Exception:
         return complex_set
     for idx in page_indices:
+        if idx in complex_set:      # đã là trang scan → khỏi xét tiếp
+            continue
         try:
             page = doc[idx]
         except Exception:
@@ -1384,21 +1808,14 @@ def _classify_pages(pdf_path: Path, page_indices: list) -> set:
                 cx = True
         except Exception:
             pass
-        # 2. Trang scan: gần như không có text nhưng có ảnh → Gemini OCR
-        if not cx and len(txt.strip()) < SCAN_TEXT_MIN:
-            try:
-                if page.get_images(full=True):
-                    cx = True
-            except Exception:
-                pass
-        # 3. Nhiều đồ hoạ vector (sơ đồ mạch, đồ thị vẽ tay) → ODL không trích được
+        # 2. Nhiều đồ hoạ vector (sơ đồ mạch, đồ thị vẽ tay) → ODL không trích được
         if not cx:
             try:
                 if len(page.get_drawings()) > DRAW_THRESHOLD:
                     cx = True
             except Exception:
                 pass
-        # 4. Mật độ công thức cao → Gemini. ĐẾM CẢ ký tự Toán in nghiêng Unicode
+        # 3. Mật độ công thức cao → Gemini. ĐẾM CẢ ký tự Toán in nghiêng Unicode
         #    (𝑥 𝜔 𝜑 𝜋 — block U+1D400+) vì nhiều PDF dùng block này cho công thức
         #    (fitz đọc Greek thường = 0 nhưng thực ra đầy 𝜔𝜑). + nhận diện hàm cos/sin.
         if not cx:
@@ -1408,14 +1825,14 @@ def _classify_pages(pdf_path: Path, page_indices: list) -> set:
             has_func = bool(_rm.search(r'\b(cos|sin|tan|cot|log|ln|sqrt)\b', txt)) or '√' in txt
             if (n_sym + n_mathit) >= MATH_THRESHOLD or (has_func and n_mathit >= 2):
                 cx = True
-        # 5. Có phân số THẬT (π/4, 3/2, λ/2) → ODL hay mất dấu "/" → Gemini đọc lại.
+        # 4. Có phân số THẬT (π/4, 3/2, λ/2) → ODL hay mất dấu "/" → Gemini đọc lại.
         #    Chỉ bắt số/Hy-Lạp ở CẢ 2 vế → KHÔNG nhầm đơn vị "m/s", "km/h" (chữ/chữ).
         if not cx:
             import re as _re2
             n_frac = len(_re2.findall(r'[\dπλμαβγθωφ]\s*/\s*[\dπλμαβγθωφ]', txt))
             if n_frac >= FRAC_THRESHOLD:
                 cx = True
-        # 6. Ký hiệu khoa học 10^n bị làm phẳng (1,5.106, X.102, 3.10-6) → Gemini
+        # 5. Ký hiệu khoa học 10^n bị làm phẳng (1,5.106, X.102, 3.10-6) → Gemini
         #    đọc lại số mũ từ ảnh (PDF text layer hay mất superscript)
         if not cx:
             import re as _re3
@@ -1439,22 +1856,57 @@ def _odl_text_only(pdf_path: Path, work_dir: Path, page_range: str,
         os.environ["JAVA_HOME"] = str(Path(jdir).parent)
     kw = dict(input_path=[str(pdf_path)], output_dir=str(work_dir),
               format="markdown", hybrid="docling-fast", hybrid_mode="auto",
-              hybrid_fallback=True, quiet=True)
+              hybrid_fallback=True, quiet=True,
+              include_header_footer=True)   # xem ghi chú ở _convert_via_odl
     if page_range:
         kw["pages"] = page_range
-    opendataloader_pdf.convert(**kw)
-    md = _merge_md_files(work_dir)
+    _run_odl(kw)
+    md = _strip_rule_lines(_merge_md_files(work_dir))
     md = _remove_page_images(md)        # chỉ PIL, an toàn
     md = _strip_answer_bullets(md)
     md = _apply_bold_formatting(md)
-    return md.read_text(encoding="utf-8", errors="replace")
+    txt = md.read_text(encoding="utf-8", errors="replace")
+    # Với trang scan, thứ duy nhất ODL xuất ra là ảnh nguyên trang — mà
+    # _remove_page_images vừa xoá nó. Trước đây hàm trả "" và caller coi như
+    # thành công → trang mất trắng, không marker, không log, không báo UI.
+    if _meaningful_text_len(txt) <= 50:
+        raise PageLost(f"ODL không lấy được chữ nào ở trang {page_range or 'tất cả'}")
+    return txt
+
+
+def _page_failure_marker(idx: int, reason: str, fig_dir: Path,
+                         pdf_path: Path, partial: str = "") -> str:
+    """
+    Lưới an toàn cuối cùng: trang không đọc được chữ thì NHÚNG ẢNH TRANG GỐC vào
+    Word kèm cảnh báo, thay vì để trang trắng. Thầy vẫn đọc được nội dung và biết
+    đích danh trang nào cần chuyển lại.
+    """
+    note = (f"\n\n> ⚠️ **[Trang {idx+1}]** Không đọc được chữ ({reason}). "
+            f"Ảnh gốc của trang ở dưới — hãy chuyển lại riêng trang này.\n\n")
+    try:
+        import fitz
+        name = f"p{idx+1}_fullpage.png"
+        doc = fitz.open(str(pdf_path))
+        try:
+            pix = doc[idx].get_pixmap(matrix=fitz.Matrix(3, 3))
+            pix.set_dpi(216, 216)
+            pix.save(str(fig_dir / name))
+        finally:
+            doc.close()
+        note += f"![Trang {idx+1}](figures/{name})\n\n"
+    except Exception:
+        note += f"*(Không render được ảnh trang {idx+1}.)*\n\n"
+    # Giữ phần chữ đã đọc được (nếu có) — thà ít còn hơn không
+    if (partial or "").strip():
+        note += partial.strip() + "\n"
+    return note
 
 
 def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
                         gemini_api_key: str = "", page_range: str | None = None,
                         niner_url: str = "", niner_key: str = "",
                         gemini_model: str = "ag/gemini-3.7-flash-low",
-                        progress_cb=None) -> Path:
+                        progress_cb=None) -> tuple:
     """
     LAI theo trang: ODL cho trang chữ (gom cụm liên tiếp → ít lần gọi), Gemini
     Vision cho trang phức tạp (chạy SONG SONG 4 luồng). Ghép theo đúng thứ tự.
@@ -1483,23 +1935,43 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
     n = doc.page_count
     page_indices = _parse_page_range(page_range, n) if page_range else list(range(n))
 
+    # Nhận diện trang scan TRƯỚC (chống watermark) rồi mới phân loại phức tạp.
+    # Trang scan BẮT BUỘC đi Gemini: ODL không có gì để lấy ở trang không có chữ.
+    detect = detect_text_layer(str(pdf_path), page_indices=page_indices)
+    scan_set = set(detect.get("scan_pages") or ())
+
     # Vision chạy được qua cả 9Router (_vision_call route theo prefix model) —
     # chỉ gate theo gemini_api_key sẽ tắt nhầm Vision khi thầy dùng 9Router-only.
-    complex_set = (_classify_pages(pdf_path, page_indices)
+    complex_set = (_classify_pages(pdf_path, page_indices, scan_set=scan_set)
                    if (gemini_api_key or niner_key) else set())
     n_cx = len(complex_set)
     n_sm = len(page_indices) - n_cx
-    _emit("detect", f"Phân loại: {n_sm} trang chữ (ODL) · {n_cx} trang phức tạp (Gemini song song)")
+    n_scan = len(scan_set)
+    _emit("detect", f"Phân loại: {n_sm} trang chữ (ODL) · {n_cx} trang phức tạp (Gemini song song)"
+                    + (f" — trong đó {n_scan} trang là bản scan" if n_scan else ""))
 
     # Không có trang phức tạp (hoặc không có key) → pure ODL nhanh như cũ
     if not complex_set:
         doc.close()
-        return _convert_via_odl(pdf_path, work_dir, gemini_api_key=gemini_api_key,
-                                page_range=page_range, niner_url=niner_url,
-                                niner_key=niner_key, progress_cb=progress_cb)
+        if scan_set:
+            # Có trang scan mà không có key nào → ODL sẽ trả trang trắng. Báo rõ
+            # thay vì xuất ra file Word rỗng và nói "Hoàn tất".
+            raise RuntimeError(
+                f"PDF này có {len(scan_set)} trang là bản scan (ảnh chụp) nên cần AI "
+                f"đọc chữ, nhưng chưa có API key. Vào Cài đặt nhập Gemini API key "
+                f"hoặc bật 9Router rồi thử lại.")
+        md = _convert_via_odl(pdf_path, work_dir, gemini_api_key=gemini_api_key,
+                              page_range=page_range, niner_url=niner_url,
+                              niner_key=niner_key, progress_cb=progress_cb)
+        return md, {"failed_pages": [], "truncated_pages": [],
+                    "scan_pages": [], "ocr_used": False}
 
-    # Render PNG trang phức tạp ở luồng chính (fitz không an toàn đa luồng)
-    png_map = {idx: _render_page_png(doc, idx) for idx in complex_set}
+    # Render PNG trang phức tạp ở luồng chính (fitz không an toàn đa luồng).
+    # Trang SCAN render ở zoom 3 (216 DPI) thay vì zoom 2 (144 DPI): đo thực tế
+    # trên đề scan của thầy cho +38% chữ đọc được, chi phí chỉ 0,2s/trang.
+    # Trang digital giữ zoom 2 → không đụng đường đang chạy tốt.
+    png_map = {idx: _render_page_png(doc, idx, zoom=(3 if idx in scan_set else 2))
+               for idx in complex_set}
     doc.close()
 
     # Gom segment liên tiếp cùng loại (giữ thứ tự)
@@ -1514,29 +1986,101 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
     results = {}
     done = [0]
     odl_lock = threading.Lock()
+    failed_pages = []       # trang không đọc được chữ (đã chèn ảnh trang gốc)
+    truncated_pages = []    # trang phải đọc lại theo nửa vì hết hạn mức
 
     def _do_simple(start, idxs):
         pr = f"{idxs[0]+1}-{idxs[-1]+1}" if len(idxs) > 1 else f"{idxs[0]+1}"
         with odl_lock:   # 1 ODL server → tuần tự
             try:
                 md = _odl_text_only(pdf_path, work_dir / f"seg_{start}_odl", pr, progress_cb)
+                # Ảnh ODL nằm trong seg_X_odl/<stem>_images/ nhưng md gộp ghi ở work_dir
+                # → đường dẫn tương đối gãy, Pandoc lặng lẽ bỏ ảnh. Thêm tiền tố thư mục đoạn.
+                import re as _re_seg
+                md = _re_seg.sub(
+                    r'\]\((<?)([^)<>]*_images[/\\][^)<>]*)(>?)\)',
+                    lambda m: f"]({m.group(1)}seg_{start}_odl/{m.group(2)}{m.group(3)})",
+                    md)
             except Exception as e:
                 md = f"[Lỗi ODL trang {idxs[0]+1}-{idxs[-1]+1}: {str(e)[:100]}]"
         results[start] = md
         _emit("odl", f"ODL xong dải trang {idxs[0]+1}-{idxs[-1]+1}")
 
+    def _read_halves(idx, b, w, h, is_scan):
+        """Trang bị cắt giữa đường → đọc lại theo 2 nửa chồng lấn rồi nối."""
+        halves = _png_halves(b)
+        if not halves:
+            return ""
+        parts = []
+        for hb in halves:
+            try:
+                parts.append(_gemini_one_page(
+                    hb, w, h // 2, idx, fig_dir, model=gemini_model,
+                    niner_url=niner_url, niner_key=niner_key,
+                    gemini_api_key=gemini_api_key, scan=is_scan,
+                    prompt_extra=_SCAN_STRIP_HINT))
+            except Exception:
+                continue
+        return "\n\n".join(p for p in parts if p).strip()
+
     def _do_complex(idx):
         b, w, h = png_map[idx]
+        is_scan = idx in scan_set
+        md, why = "", ""
+
+        # Bậc 1: Vision qua 9Router, prompt + zoom theo loại trang
         try:
             md = _gemini_one_page(b, w, h, idx, fig_dir, model=gemini_model,
                                   niner_url=niner_url, niner_key=niner_key,
-                                  gemini_api_key=gemini_api_key)
-        except Exception:
-            with odl_lock:   # fallback ODL trang này
+                                  gemini_api_key=gemini_api_key, scan=is_scan)
+            # Bậc 2: API không báo nhưng trông như bị cắt → đọc lại theo nửa trang
+            if _looks_truncated(md):
+                _emit("gemini", f"Trang {idx+1} trông như bị cắt — đọc lại theo nửa trang…")
+                better = _read_halves(idx, b, w, h, is_scan)
+                if _meaningful_text_len(better) > _meaningful_text_len(md):
+                    md = better
+        except VisionTruncated as e:
+            # Bậc 2: hết hạn mức output → chia nửa trang
+            _emit("gemini", f"Trang {idx+1} dày chữ, hết hạn mức — đọc lại theo nửa trang…")
+            truncated_pages.append(idx + 1)
+            md = _read_halves(idx, b, w, h, is_scan)
+            if _meaningful_text_len(md) < _meaningful_text_len(e.partial):
+                md = e.partial     # thà giữ phần đọc được còn hơn mất trắng
+            why = "hết hạn mức output"
+        except Exception as e:
+            why = str(e)[:120]
+            # Bậc 3: Gemini trực tiếp bằng key của thầy (9Router sập / bị chặn)
+            if gemini_api_key:
+                for fb in _GEMINI_DIRECT_MODELS:
+                    try:
+                        _emit("gemini", f"Trang {idx+1}: thử lại bằng {fb}…")
+                        md = _gemini_one_page(
+                            b, w, h, idx, fig_dir, model=fb,
+                            gemini_api_key=gemini_api_key, scan=is_scan)
+                        why = ""
+                        break
+                    except Exception as e2:
+                        why = str(e2)[:120]
+                        continue
+
+        # Bậc 4: vẫn trống → ODL, nhưng CHỈ cho trang digital. Trang scan không
+        # có chữ cho ODL lấy, gọi chỉ tốn thời gian rồi vẫn rỗng.
+        if _meaningful_text_len(md) <= 40 and not is_scan:
+            with odl_lock:
                 try:
                     md = _odl_text_only(pdf_path, work_dir / f"seg_{idx}_fb", str(idx + 1))
+                    why = ""
                 except Exception as e:
-                    md = f"[Lỗi trang {idx+1}: {str(e)[:100]}]"
+                    why = str(e)[:120]
+
+        # Bậc 5: hết cách → chèn ảnh nguyên trang + ghi nhận trang lỗi.
+        # Bảo đảm cứng: KHÔNG BAO GIỜ để trang mất trắng không dấu vết.
+        if _meaningful_text_len(md) <= 40:
+            md = _page_failure_marker(idx, why or "không đọc được chữ",
+                                      fig_dir, pdf_path, md)
+            failed_pages.append(idx + 1)
+            _emit("gemini", f"⚠️ Trang {idx+1} không đọc được — đã chèn ảnh trang gốc")
+
         results[idx] = md
         done[0] += 1
         _emit("gemini", f"Gemini xong {done[0]}/{n_cx} trang phức tạp…")
@@ -1557,11 +2101,33 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
         for f in as_completed(futs):
             f.result()
 
-    # Ghép theo thứ tự task (đã theo thứ tự tài liệu)
-    md_all = "\n\n---\n\n".join(results.get(st, "") for (k, st, ix) in tasks)
+    # Kiểm toán cuối: lưới an toàn độc lập với mọi nhánh ở trên. Đây là chỗ DUY
+    # NHẤT phán quyết "trang này rỗng" nên không đường nào lọt được.
+    for (k, st, ix) in tasks:
+        if k != "C":
+            continue
+        if _meaningful_text_len(results.get(st, "")) <= 40 and (st + 1) not in failed_pages:
+            results[st] = _page_failure_marker(st, "kết quả rỗng sau mọi bước thử",
+                                               fig_dir, pdf_path, results.get(st, ""))
+            failed_pages.append(st + 1)
+
+    # Ghép theo thứ tự task (đã theo thứ tự tài liệu), kèm mốc trang để bước gắn
+    # hình biết hình của trang nào phải nằm trong khoảng dòng nào (trang scan
+    # không có lớp text nên không so khớp chuỗi được). Mốc bị xoá trước Pandoc.
+    chunks = []
+    for (k, st, ix) in tasks:
+        body = results.get(st, "")
+        chunks.append(f"<!-- p2w:page={ix[0]+1} -->\n{body}")
+    md_all = "\n\n---\n\n".join(chunks)
     md_path = work_dir / (_safe_stem(pdf_path.name) + "_hybrid.md")
     md_path.write_text(md_all, encoding="utf-8")
-    return md_path
+    stats = {
+        "failed_pages": sorted(set(failed_pages)),
+        "truncated_pages": sorted(set(truncated_pages)),
+        "scan_pages": sorted(p + 1 for p in scan_set),
+        "ocr_used": bool(scan_set),
+    }
+    return md_path, stats
 
 
 def _extract_digital_pdf_images(pdf_path: Path, work_dir: Path,
@@ -1644,6 +2210,22 @@ def _extract_digital_pdf_images(pdf_path: Path, work_dir: Path,
     return md_path
 
 
+def _attach_det_figures(pdf_path: Path, work_dir: Path, md_path: Path,
+                        page_range: str | None, _emit) -> Path:
+    """Bước gắn hình XÁC ĐỊNH cho mọi method odl/hybrid/gemini (core.pdf_word_figures):
+    ảnh nhúng + hình vector (cùng bộ pdf_figures của luồng nhập đề) → cắt từ trang →
+    neo vào câu trong md. Gemini/ODL chỉ là nguồn bổ sung; bước này không bao giờ
+    làm hỏng tài liệu (lỗi → giữ nguyên md)."""
+    try:
+        from core.pdf_word_figures import attach_figures
+        _emit("img", "Đang trích hình vẽ, đồ thị (ảnh nhúng + vector) và gắn vào câu…")
+        n = attach_figures(pdf_path, work_dir, md_path, page_range=page_range)
+        _emit("img", f"Đã gắn {n} hình vào tài liệu")
+    except Exception as e:
+        _emit("img", f"Bỏ qua trích hình: {str(e)[:80]}")
+    return md_path
+
+
 def _safe_stem(name: str) -> str:
     stem = Path(name).stem
     safe = "".join(c for c in stem if c.isalnum() or c in " _-").strip()
@@ -1688,6 +2270,10 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
     if work_dir.exists():
         shutil.rmtree(work_dir, ignore_errors=True)
 
+    # PDF khoá quyền (owner password) → ODL/Java từ chối; gỡ trước khi chuyển.
+    # Đặt SAU khi tính work_dir/out_path để tên thư mục/file giữ theo tên gốc.
+    pdf_path = _strip_pdf_encryption(pdf_path, progress_cb=_emit)
+
     # Quyết định method
     if method == "auto":
         if odl_available() and gemini_api_key:
@@ -1698,13 +2284,16 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
             method = "marker"
 
     t0 = time.time()
+    # Mặc định cho các nhánh không đi qua Vision (odl/marker)
+    stats = {"failed_pages": [], "truncated_pages": [], "scan_pages": [],
+             "ocr_used": False}
 
     if method == "hybrid":
         if not odl_available() or not java_available():
             _emit("detect", "Thiếu ODL/Java — chuyển sang Gemini Vision toàn bộ…")
-            md = _convert_via_gemini(pdf_path, work_dir, gemini_api_key,
-                                     page_range=page_range, niner_url=niner_url,
-                                     niner_key=niner_key, progress_cb=progress_cb)
+            md, stats = _convert_via_gemini(pdf_path, work_dir, gemini_api_key,
+                                            page_range=page_range, niner_url=niner_url,
+                                            niner_key=niner_key, progress_cb=progress_cb)
             method = "gemini"
         else:
             _emit("detect", "Chế độ lai: ODL (trang chữ) + Gemini Vision (trang phức tạp)…")
@@ -1712,13 +2301,14 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
             # vẫn tiếp tục — opendataloader_pdf.convert có hybrid_fallback=True
             if not _ensure_odl_server(progress_cb=progress_cb):
                 _emit("odl", "ODL server không khởi động được — tiếp tục với fallback (chậm hơn)")
-            md = _convert_via_hybrid(pdf_path, work_dir,
-                                     gemini_api_key=gemini_api_key,
-                                     page_range=page_range,
-                                     niner_url=niner_url, niner_key=niner_key,
-                                     progress_cb=progress_cb)
+            md, stats = _convert_via_hybrid(pdf_path, work_dir,
+                                            gemini_api_key=gemini_api_key,
+                                            page_range=page_range,
+                                            niner_url=niner_url, niner_key=niner_key,
+                                            progress_cb=progress_cb)
         detect = detect_text_layer(str(pdf_path))
-        ocr_used = False
+        ocr_used = bool(stats.get("ocr_used"))
+        md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit)
 
     elif method == "odl":
         if not odl_available():
@@ -1747,11 +2337,12 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
                 work_dir2 = MARKER_OUT / (_safe_stem(pdf_path.name) + "_gemini")
                 if work_dir2.exists():
                     shutil.rmtree(work_dir2, ignore_errors=True)
-                md = _convert_via_gemini(pdf_path, work_dir2, gemini_api_key,
-                                         page_range=page_range, niner_url=niner_url,
-                                         niner_key=niner_key, progress_cb=progress_cb)
+                md, stats = _convert_via_gemini(pdf_path, work_dir2, gemini_api_key,
+                                                page_range=page_range, niner_url=niner_url,
+                                                niner_key=niner_key, progress_cb=progress_cb)
                 work_dir = work_dir2
                 method = "gemini"
+                ocr_used = bool(stats.get("ocr_used"))
             elif marker_available():
                 _emit("detect",
                       "PDF không có lớp text (bản scan) — tự động dùng Marker OCR…")
@@ -1775,19 +2366,21 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
                     "Vui lòng nhập Gemini API key trong Cài đặt để tự động OCR."
                 )
         else:
-            # PDF digital có text → trích xuất ảnh nhúng (hình vẽ, đồ thị) từ PDF
-            _emit("img", "Đang trích xuất hình vẽ, đồ thị từ PDF…")
-            md = _extract_digital_pdf_images(pdf_path, work_dir, md)
+            # PDF digital có text → trích hình xác định (ảnh nhúng + vector) và neo vào câu.
+            # (Thay _extract_digital_pdf_images cũ: chỉ ảnh nhúng, đặt theo Y ước lượng,
+            # trùng với ảnh ODL tự xuất, không có hình vector.)
+            md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit)
 
     elif method == "gemini":
         if not gemini_api_key:
             raise RuntimeError("Cần nhập Gemini API key trong Cài đặt.")
         _emit("detect", "Dùng Gemini Vision để nhận diện nội dung và hình vẽ…")
-        md = _convert_via_gemini(pdf_path, work_dir, gemini_api_key,
-                                 page_range=page_range, niner_url=niner_url,
-                                 niner_key=niner_key, progress_cb=progress_cb)
+        md, stats = _convert_via_gemini(pdf_path, work_dir, gemini_api_key,
+                                        page_range=page_range, niner_url=niner_url,
+                                        niner_key=niner_key, progress_cb=progress_cb)
         detect = detect_text_layer(str(pdf_path))
-        ocr_used = False
+        ocr_used = bool(stats.get("ocr_used"))
+        md = _attach_det_figures(pdf_path, work_dir, md, page_range, _emit)
 
     else:  # marker
         if not marker_available():
@@ -1798,7 +2391,10 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
         elif ocr_mode == "force":
             disable_ocr = False
         else:
-            disable_ocr = bool(detect.get("is_digital"))
+            # Có BẤT KỲ trang scan nào thì vẫn phải OCR — PDF scan có watermark
+            # ở lớp text từng bị is_digital=True và tắt OCR, mất sạch nội dung.
+            disable_ocr = (bool(detect.get("is_digital"))
+                           and not detect.get("scan_pages"))
         mode_label = "bỏ OCR" if disable_ocr else "bật OCR (file scan)"
         _emit("detect", f"Nhận diện: {detect.get('pages_with_text')}/"
               f"{detect.get('pages')} trang có text → {mode_label}")
@@ -1827,7 +2423,11 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
     docx = _run_pandoc(md, out_path)
 
     seconds = round(time.time() - t0, 1)
-    _emit("done", f"Hoàn tất sau {seconds}s")
+    fp = stats.get("failed_pages") or []
+    if fp:
+        _emit("done", f"Hoàn tất sau {seconds}s — {len(fp)} trang không đọc được: {fp}")
+    else:
+        _emit("done", f"Hoàn tất sau {seconds}s")
     return {
         "docx_path": str(docx),
         "docx_name": docx.name,
@@ -1835,4 +2435,7 @@ def convert_pdf_to_word(pdf_path: str, out_docx: str | None = None,
         "ocr_used": ocr_used,
         "method": method,
         "detect": detect,
+        "failed_pages": fp,
+        "truncated_pages": stats.get("truncated_pages") or [],
+        "scan_pages": stats.get("scan_pages") or [],
     }

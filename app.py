@@ -266,7 +266,9 @@ def api_import():
 
         return jsonify({'success': True, 'document': doc.to_dict(),
                         'original_file': display_file, 'original_ext': display_ext,
-                        'import_method': import_method})
+                        'import_method': import_method,
+                        # AI Vision bị chặn/lỗi 1 phần → đã đọc bù bằng lớp chữ, nhắc thầy kiểm tra
+                        'import_warning': getattr(doc, 'import_warning', '') or ''})
     except Exception as e:
         if os.path.exists(orig_path):
             os.remove(orig_path)
@@ -1006,12 +1008,20 @@ def _p2w_worker_loop():
                         progress_cb=_cb)
                     # Copy sang Downloads/OneDrive/GDrive
                     saved = copy_to_destinations(result['docx_path'], settings)
+                    fp = result.get('failed_pages') or []
+                    scan = result.get('scan_pages') or []
                     item['status'] = 'done'
                     item['seconds'] = result['seconds']
                     item['ocr_used'] = result['ocr_used']
                     item['detect'] = result['detect']
                     item['saved_to'] = saved
-                    item['message'] = f"Xong sau {result['seconds']}s"
+                    item['failed_pages'] = fp
+                    item['scan_pages'] = scan
+                    item['truncated_pages'] = result.get('truncated_pages') or []
+                    item['message'] = (
+                        f"Xong sau {result['seconds']}s" if not fp
+                        else f"Xong sau {result['seconds']}s — {len(fp)} trang "
+                             f"không đọc được: {fp}")
             except Exception as e:
                 item['status'] = 'error'
                 item['error'] = str(e)
@@ -1120,6 +1130,8 @@ def api_pdf_to_word_status(job_id):
         'stage': it.get('stage', ''), 'message': it.get('message', ''),
         'seconds': it.get('seconds'), 'ocr_used': it.get('ocr_used'),
         'out_name': it['out_name'], 'error': it.get('error'),
+        'failed_pages': it.get('failed_pages') or [],
+        'scan_pages': it.get('scan_pages') or [],
     } for it in job['files']]
     all_done = all(it['status'] in ('done', 'error') for it in job['files'])
     return jsonify({'job_id': job_id, 'files': files, 'all_done': all_done})
