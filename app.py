@@ -66,6 +66,12 @@ def _cleanup_old_files():
                     pass
     except Exception as e:
         print(f'[Cleanup] {e}', flush=True)
+    # Bộ nhớ đệm kết quả Vision từng trang (PDF→Word) không dùng quá 7 ngày
+    try:
+        from core.pdf_to_word import cleanup_page_cache
+        cleanup_page_cache()
+    except Exception as e:
+        print(f'[Cleanup] page cache: {e}', flush=True)
 
 
 import threading as _cleanup_threading
@@ -1102,6 +1108,19 @@ def api_pdf_to_word():
 
     if not items:
         return jsonify({'error': 'Không có file PDF hợp lệ'}), 400
+
+    # Sách scan lớn → hỏi trước (thời gian dự kiến + gợi ý chia dải 50 trang),
+    # trừ khi thầy đã chọn "Vẫn chuyển cả file" (allow_large=1).
+    if output == 'word' and request.form.get('allow_large') != '1':
+        from core.pdf_to_word import scan_size_check
+        warns = []
+        for it in items:
+            chk = scan_size_check(it['src_path'], page_range)
+            if chk.get('large'):
+                warns.append({'name': it['name'], **chk})
+        if warns:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            return jsonify({'needs_confirm': True, 'warnings': warns})
 
     # Dọn entry job cũ hơn 1 ngày (dict này sống suốt vòng đời app)
     cutoff = time.time() - 86400

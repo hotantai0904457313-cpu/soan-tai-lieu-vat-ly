@@ -859,6 +859,24 @@ body {
   cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px;
 }
 .p2w-x:hover { background: #f0d0d0; color: var(--red); }
+
+/* Cảnh báo tài liệu scan lớn trong modal PDF→Word */
+.p2w-large-warn {
+  margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+  background: #fff8e6; border: 1.5px solid #f0c36d; font-size: 12.5px; line-height: 1.5;
+}
+.p2w-large-warn[hidden] { display: none; }
+.p2w-lw-title { font-weight: 700; color: #8a5a00; margin-bottom: 4px; }
+.p2w-lw-line { color: #5c4a1a; margin-top: 3px; }
+.p2w-lw-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.p2w-lw-chip {
+  padding: 3px 10px; border-radius: 12px; border: 1.5px solid var(--navy);
+  background: #fff; color: var(--navy); font-size: 12px; font-family: inherit; cursor: pointer;
+}
+.p2w-lw-chip:hover { background: #eef3fb; }
+.p2w-lw-chip.used { background: #e8f0e8; border-color: #6a9a6a; color: #2e5e2e; }
+.p2w-lw-chip.picked { background: var(--navy); color: #fff; border-color: var(--navy); }
+.p2w-lw-acts { margin-top: 10px; display: flex; justify-content: flex-end; }
 .p2w-dl {
   border: 1px solid var(--navy); background: var(--navy); color: #fff;
   cursor: pointer; font-size: 12px; padding: 4px 10px; border-radius: 5px;

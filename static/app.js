@@ -1670,6 +1670,7 @@ let p2wPollTimer = null;
 async function openP2W() {
   p2wPending = [];
   p2wJobId = null;
+  p2wHideLargeWarn();
   if ($('p2w-page-enable')) { $('p2w-page-enable').checked = false; p2wTogglePageRange(false); }
   if (p2wPollTimer) { clearInterval(p2wPollTimer); p2wPollTimer = null; }
   $('p2w-list').innerHTML = '';
@@ -1730,6 +1731,7 @@ function p2wDrop(ev) {
 }
 
 function p2wAddFiles(fileList) {
+  p2wHideLargeWarn();
   const files = [...fileList].filter(f => f.name.toLowerCase().endsWith('.pdf'));
   for (const f of files) {
     if (!p2wPending.some(p => p.name === f.name && p.size === f.size)) p2wPending.push(f);
@@ -1762,6 +1764,8 @@ async function p2wStart() {
   const fd = new FormData();
   p2wPending.forEach(f => fd.append('files', f));
   fd.append('ocr_mode', 'auto');
+  if (p2wAllowLarge) fd.append('allow_large', '1');
+  p2wAllowLarge = false;
   const methodEl = document.querySelector('[name=p2wMethod]:checked');
   fd.append('method', methodEl ? methodEl.value : 'auto');
   // Page range
@@ -1782,6 +1786,11 @@ async function p2wStart() {
         : 'Lỗi server (' + r.status + ')');
       showToast(msg, 'error'); p2wResetBtn(); return;
     }
+    if (d.needs_confirm) {           // tài liệu scan lớn → hỏi trước khi xếp hàng
+      p2wShowLargeWarn(d.warnings || []);
+      p2wResetBtn();
+      return;
+    }
     p2wJobId = d.job_id;
     showToast('Đã xếp hàng ' + d.files.length + ' file. Đang xử lý...', 'info');
     p2wRenderStatus(d.files.map(f => ({ ...f, message: 'Đang chờ…' })));
@@ -1791,6 +1800,72 @@ async function p2wStart() {
     showToast('Lỗi kết nối: ' + e.message, 'error');
     p2wResetBtn();
   }
+}
+
+// ── Tài liệu scan lớn: cảnh báo + gợi ý chia dải ─────────────────
+let p2wAllowLarge = false;
+let p2wLargeFiles = [];     // giữ file để chuyển tiếp các dải sau (p2wPending bị xoá khi xong)
+
+function p2wHideLargeWarn() {
+  const box = $('p2w-large-warn');
+  if (box) { box.hidden = true; box.innerHTML = ''; }
+  p2wLargeFiles = [];
+}
+
+function p2wShowLargeWarn(warns) {
+  const box = $('p2w-large-warn');
+  if (!box) return;
+  box.innerHTML = '';
+  box.appendChild(el('div', 'p2w-lw-title', '⚠️ Tài liệu scan lớn — sẽ mất nhiều thời gian'));
+  warns.forEach(w => {
+    const line = el('div', 'p2w-lw-line');
+    line.textContent = `${w.name}: ${w.scan_pages}/${w.pages} trang là bản scan, AI phải đọc `
+      + `từng trang — dự kiến khoảng ${w.est_min} phút.`;
+    box.appendChild(line);
+  });
+  const single = warns.length === 1 && p2wPending.length === 1;
+  const hint = el('div', 'p2w-lw-line');
+  if (single) {
+    p2wLargeFiles = p2wPending.slice();
+    hint.textContent = 'Khuyên dùng: chuyển theo dải 50 trang — mỗi dải ra một file Word, '
+      + 'lỗi giữa chừng không mất cả quyển. Bấm một dải để điền vào ô "Chọn trang":';
+    box.appendChild(hint);
+    const chips = el('div', 'p2w-lw-chips');
+    (warns[0].ranges || []).forEach(rg => {
+      const b = el('button', 'p2w-lw-chip');
+      b.type = 'button';
+      b.textContent = rg;
+      b.onclick = () => p2wPickRange(rg, b);
+      chips.appendChild(b);
+    });
+    box.appendChild(chips);
+  } else {
+    hint.textContent = 'Khuyên dùng: chuyển riêng từng file lớn và chia theo dải 50 trang '
+      + '(ô "Chọn trang").';
+    box.appendChild(hint);
+  }
+  const acts = el('div', 'p2w-lw-acts');
+  const go = el('button', 'btn btn-secondary');
+  go.type = 'button';
+  go.textContent = 'Vẫn chuyển cả file';
+  go.onclick = () => { p2wAllowLarge = true; p2wHideLargeWarn(); p2wStart(); };
+  acts.appendChild(go);
+  box.appendChild(acts);
+  box.hidden = false;
+}
+
+function p2wPickRange(rg, chip) {
+  const cb = $('p2w-page-enable');
+  if (cb && !cb.checked) { cb.checked = true; p2wTogglePageRange(true); }
+  if ($('p2w-pages')) $('p2w-pages').value = rg;
+  // Dải trước đã chuyển xong thì p2wPending đã bị xoá → nạp lại đúng file đó
+  if (!p2wPending.length && p2wLargeFiles.length) p2wPending = p2wLargeFiles.slice();
+  document.querySelectorAll('.p2w-lw-chip.picked').forEach(c => c.classList.remove('picked'));
+  if (chip) chip.classList.add('picked', 'used');
+  $('p2w-start-btn').disabled = false;
+  $('p2w-start-btn').textContent = '🚀 Bắt đầu chuyển';
+  showToast('Đã điền dải ' + rg + ' — bấm "Bắt đầu chuyển". Xong dải này thì bấm dải tiếp theo.',
+            'info', 6000);
 }
 
 function p2wResetBtn() {

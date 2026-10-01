@@ -1401,13 +1401,151 @@ def _fig_bbox_pct(fig: dict) -> list:
     return [xa[0], ya[0], xa[1], ya[1]]
 
 
+# PyMuPDF KHÔNG an toàn đa luồng — mọi lần mở/render từ luồng phụ phải đi qua
+# khoá này (render ảnh trang theo yêu cầu, ảnh trang gốc khi trang lỗi).
+_FITZ_LOCK = threading.RLock()
+
+
+class _PageRenderer:
+    """Render ảnh trang THEO YÊU CẦU trong luồng làm việc, thay vì render trước
+    mọi trang ở luồng chính (sách scan 436 trang × ~0,5 MB ≈ 214 MB RAM giữ suốt
+    quá trình). Render ~0,3 s trong khi mỗi lời gọi Vision ~10 s chạy song song
+    nên khoá không thành cổ chai; đỉnh RAM chỉ còn vài trang đang xử lý."""
+
+    def __init__(self, pdf_path: Path, scan_set: set):
+        import fitz
+        with _FITZ_LOCK:
+            self._doc = fitz.open(str(pdf_path))
+        self._scan = set(scan_set or ())
+
+    def __call__(self, idx: int):
+        with _FITZ_LOCK:
+            return _render_page_png(self._doc, idx,
+                                    zoom=(3 if idx in self._scan else 2))
+
+    def close(self):
+        with _FITZ_LOCK:
+            try:
+                self._doc.close()
+            except Exception:
+                pass
+
+
+# Bộ nhớ đệm kết quả Vision TỪNG TRANG — chạy lại (đứt mạng giữa chừng, chuyển
+# lại dải trang chồng nhau, chuyển lại cả file) không phải gọi AI lại trang đã
+# đọc. KHOÁ THEO NỘI DUNG PDF + model + prompt, KHÔNG theo thư mục làm việc: file
+# upload luôn tên 0.pdf, 1.pdf… nên marker_out/0 dùng chung cho mọi đề khác nhau.
+_PAGE_CACHE_DIR = MARKER_OUT / "_page_cache"
+_PAGE_CACHE_VERSION = "1"      # tăng khi đổi cách hậu xử lý markdown trang
+_PAGE_CACHE_DAYS = 7
+
+
+def _page_cache_key(pdf_path: Path, model: str) -> str:
+    import hashlib
+    h = hashlib.sha1()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    for part in (model, _SCAN_PROMPT, _GEMINI_PROMPT, _PAGE_CACHE_VERSION):
+        h.update((part or "").encode("utf-8"))
+    return h.hexdigest()[:20]
+
+
+class _PageCache:
+    """markdown + hình (p{N}_fig*.png, p{N}_gemini_boxes*.json) của từng trang đã
+    đọc THÀNH CÔNG. Trang lỗi (ảnh trang gốc + cảnh báo) không lưu → lần sau đọc
+    lại. Mọi lỗi I/O đều bỏ qua: bộ nhớ đệm chỉ để nhanh hơn, không được làm hỏng
+    việc chuyển."""
+
+    def __init__(self, pdf_path: Path, model: str, fig_dir: Path):
+        self.fig_dir = fig_dir
+        try:
+            self.dir = _PAGE_CACHE_DIR / _page_cache_key(pdf_path, model)
+        except Exception:
+            self.dir = None
+
+    def get(self, idx: int):
+        if self.dir is None:
+            return None
+        p = self.dir / f"p{idx+1:04d}.md"
+        try:
+            if not p.exists():
+                return None
+            md = p.read_text(encoding="utf-8")
+            for f in self.dir.glob(f"p{idx+1}_*"):
+                shutil.copy2(f, self.fig_dir / f.name)
+            os.utime(self.dir)          # còn dùng → chưa bị dọn
+            return md
+        except Exception:
+            return None
+
+    def put(self, idx: int, md: str) -> None:
+        if self.dir is None:
+            return
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            for f in self.fig_dir.glob(f"p{idx+1}_*"):
+                if f.name.startswith(f"p{idx+1}_fig") or "_gemini_boxes" in f.name:
+                    shutil.copy2(f, self.dir / f.name)
+            tmp = self.dir / f"p{idx+1:04d}.md.tmp"
+            tmp.write_text(md, encoding="utf-8")
+            os.replace(tmp, self.dir / f"p{idx+1:04d}.md")
+        except Exception:
+            pass
+
+
+def cleanup_page_cache(days: int = _PAGE_CACHE_DAYS) -> int:
+    """Xoá bộ nhớ đệm trang không dùng quá `days` ngày. Trả số thư mục đã xoá."""
+    n = 0
+    try:
+        cutoff = time.time() - days * 86400
+        for d in _PAGE_CACHE_DIR.iterdir():
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+                n += 1
+    except Exception:
+        pass
+    return n
+
+
+# Sách scan lớn: cảnh báo TRƯỚC khi xếp hàng. Thời gian ước lượng theo số đo thật
+# (01/10/2026: đề scan 20 trang 186–227 s qua 9Router ≈ 10 s/trang).
+LARGE_SCAN_PAGES = 80
+SCAN_SEC_PER_PAGE = 10
+SCAN_CHUNK = 50
+
+
+def scan_size_check(pdf_path: str, page_range: str | None = None) -> dict:
+    """Đếm trang scan trong dải trang sẽ chuyển → {pages, scan_pages, large,
+    est_min, ranges} (ranges = gợi ý chia dải SCAN_CHUNK trang, đánh số từ 1).
+    Lỗi → large=False (không chặn việc chuyển)."""
+    try:
+        import fitz
+        from core.pdf_scan import analyze_pdf
+        with fitz.open(str(pdf_path)) as d:
+            n = d.page_count
+        idxs = _parse_page_range(page_range, n) if page_range else list(range(n))
+        a = analyze_pdf(str(pdf_path), page_indices=idxs)
+        n_scan = len(a.get("scan_pages") or ())
+        ranges = []
+        for k in range(0, len(idxs), SCAN_CHUNK):
+            grp = idxs[k:k + SCAN_CHUNK]
+            ranges.append(f"{grp[0] + 1}-{grp[-1] + 1}" if len(grp) > 1 else f"{grp[0] + 1}")
+        return {"pages": len(idxs), "scan_pages": n_scan,
+                "large": n_scan > LARGE_SCAN_PAGES,
+                "est_min": max(1, round(n_scan * SCAN_SEC_PER_PAGE / 60)),
+                "ranges": ranges}
+    except Exception:
+        return {"pages": 0, "scan_pages": 0, "large": False, "est_min": 0, "ranges": []}
+
+
 def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
                      fig_dir: Path, model: str = "ag/gemini-3.7-flash-low",
                      niner_url: str = "", niner_key: str = "",
                      gemini_api_key: str = "", scan: bool = False,
                      prompt_extra: str = "", part: int = 0,
                      y_off: float = 0.0, y_span: float = 1.0,
-                     dpi: int = 144) -> str:
+                     dpi: int = 144, max_retries: int = 2) -> str:
     """Xử lý 1 trang qua Vision (9Router hoặc Gemini trực tiếp) → markdown
     (đã cắt figures/bảng theo bbox). THUẦN (không fitz) → an toàn đa luồng.
 
@@ -1433,7 +1571,7 @@ def _gemini_one_page(img_bytes: bytes, page_w: int, page_h: int, idx: int,
     prompt = (prompt_extra or "") + (_SCAN_PROMPT if scan else _GEMINI_PROMPT)
     raw = _vision_call(model, img_bytes, prompt,
                        niner_url=niner_url, niner_key=niner_key,
-                       gemini_api_key=gemini_api_key)
+                       gemini_api_key=gemini_api_key, max_retries=max_retries)
 
     m = _re.search(r'```(?:json)?\s*([\s\S]+?)```', raw)
     if m:
@@ -1785,11 +1923,11 @@ def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
     page_indices = _parse_page_range(page_range, n) if page_range else list(range(n))
     detect = detect_text_layer(str(pdf_path), page_indices=page_indices)
     scan_set = set(detect.get("scan_pages") or ())
-    # Render PNG ở luồng chính (fitz không an toàn đa luồng).
-    # Trang scan zoom 3 (216 DPI) — đo thực tế +38% chữ đọc được so với zoom 2.
-    png_map = {idx: _render_page_png(doc, idx, zoom=(3 if idx in scan_set else 2))
-               for idx in page_indices}
     doc.close()
+    # Ảnh trang render THEO YÊU CẦU (_PageRenderer). Trang scan zoom 3 (216 DPI)
+    # — đo thực tế +38% chữ đọc được so với zoom 2.
+    render = _PageRenderer(pdf_path, scan_set)
+    cache = _PageCache(pdf_path, model, fig_dir)
 
     results, done = {}, [0]
     failed_pages, truncated_pages = [], []
@@ -1801,14 +1939,20 @@ def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
                                  dpi=(216 if is_scan else 144))
 
     def _work(idx):
-        b, w, h = png_map[idx]
+        cached = cache.get(idx)
+        if cached is not None:
+            done[0] += 1
+            _emit("gemini", f"Trang {idx+1}: dùng lại kết quả đã đọc lần trước")
+            return idx, cached
+        b, w, h = render(idx)
         is_scan = idx in scan_set
         dpi = 216 if is_scan else 144
         md, why = "", ""
         try:
             md = _gemini_one_page(b, w, h, idx, fig_dir, model=model,
                                   niner_url=niner_url, niner_key=niner_key,
-                                  gemini_api_key=api_key, scan=is_scan, dpi=dpi)
+                                  gemini_api_key=api_key, scan=is_scan, dpi=dpi,
+                                  max_retries=(4 if is_scan else 2))
             if _looks_truncated(md):
                 better = _halves(idx, b, w, is_scan)
                 if _meaningful_text_len(better) > _meaningful_text_len(md):
@@ -1841,14 +1985,21 @@ def _convert_via_gemini(pdf_path: Path, work_dir: Path, api_key: str,
             md = _page_failure_marker(idx, why or "không đọc được chữ",
                                       fig_dir, pdf_path, md)
             failed_pages.append(idx + 1)
+        else:
+            cache.put(idx, md)
         done[0] += 1
         _emit("gemini", f"Vision đọc trang {done[0]}/{len(page_indices)}…")
         return idx, md
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        for fut in as_completed([ex.submit(_work, i) for i in page_indices]):
-            idx, md = fut.result()
-            results[idx] = md
+    # Sách scan lớn → 3 luồng (đỡ dính 429); đề ngắn giữ 4 luồng cho nhanh
+    n_workers = 3 if len(scan_set) > 40 else 4
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            for fut in as_completed([ex.submit(_work, i) for i in page_indices]):
+                idx, md = fut.result()
+                results[idx] = md
+    finally:
+        render.close()
 
     pages_md = [f"<!-- p2w:page={i+1} -->\n{results.get(i, '')}" for i in page_indices]
     md_path = work_dir / (pdf_path.stem + ".md")
@@ -2114,13 +2265,14 @@ def _page_failure_marker(idx: int, reason: str, fig_dir: Path,
     try:
         import fitz
         name = f"p{idx+1}_fullpage.png"
-        doc = fitz.open(str(pdf_path))
-        try:
-            pix = doc[idx].get_pixmap(matrix=fitz.Matrix(3, 3))
-            pix.set_dpi(216, 216)
-            pix.save(str(fig_dir / name))
-        finally:
-            doc.close()
+        with _FITZ_LOCK:                    # gọi từ luồng làm việc
+            doc = fitz.open(str(pdf_path))
+            try:
+                pix = doc[idx].get_pixmap(matrix=fitz.Matrix(3, 3))
+                pix.set_dpi(216, 216)
+                pix.save(str(fig_dir / name))
+            finally:
+                doc.close()
         note += f"![Trang {idx+1}](figures/{name})\n\n"
     except Exception:
         note += f"*(Không render được ảnh trang {idx+1}.)*\n\n"
@@ -2194,13 +2346,13 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
         return md, {"failed_pages": [], "truncated_pages": [],
                     "scan_pages": [], "ocr_used": False}
 
-    # Render PNG trang phức tạp ở luồng chính (fitz không an toàn đa luồng).
-    # Trang SCAN render ở zoom 3 (216 DPI) thay vì zoom 2 (144 DPI): đo thực tế
-    # trên đề scan của thầy cho +38% chữ đọc được, chi phí chỉ 0,2s/trang.
-    # Trang digital giữ zoom 2 → không đụng đường đang chạy tốt.
-    png_map = {idx: _render_page_png(doc, idx, zoom=(3 if idx in scan_set else 2))
-               for idx in complex_set}
     doc.close()
+    # Ảnh trang phức tạp render THEO YÊU CẦU trong luồng làm việc (_PageRenderer,
+    # có khoá PyMuPDF). Trang SCAN zoom 3 (216 DPI) thay vì zoom 2 (144 DPI): đo
+    # thực tế trên đề scan của thầy cho +38% chữ đọc được, chi phí 0,2 s/trang.
+    # Trang digital giữ zoom 2 → không đụng đường đang chạy tốt.
+    render = _PageRenderer(pdf_path, scan_set)
+    cache = _PageCache(pdf_path, gemini_model, fig_dir)
 
     # Gom segment liên tiếp cùng loại (giữ thứ tự)
     segments = []  # (kind, [idxs])
@@ -2242,7 +2394,14 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
                                  dpi=(216 if is_scan else 144))
 
     def _do_complex(idx):
-        b, w, h = png_map[idx]
+        cached = cache.get(idx)
+        if cached is not None:
+            results[idx] = cached
+            done[0] += 1
+            _emit("gemini", f"Trang {idx+1}: dùng lại kết quả đã đọc lần trước "
+                            f"({done[0]}/{n_cx})")
+            return
+        b, w, h = render(idx)
         is_scan = idx in scan_set
         dpi = 216 if is_scan else 144
         md, why = "", ""
@@ -2252,7 +2411,7 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
             md = _gemini_one_page(b, w, h, idx, fig_dir, model=gemini_model,
                                   niner_url=niner_url, niner_key=niner_key,
                                   gemini_api_key=gemini_api_key, scan=is_scan,
-                                  dpi=dpi)
+                                  dpi=dpi, max_retries=(4 if is_scan else 2))
             # Bậc 2: API không báo nhưng trông như bị cắt → đọc lại theo nửa trang
             if _looks_truncated(md):
                 _emit("gemini", f"Trang {idx+1} trông như bị cắt — đọc lại theo nửa trang…")
@@ -2306,6 +2465,8 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
                                       fig_dir, pdf_path, md)
             failed_pages.append(idx + 1)
             _emit("gemini", f"⚠️ Trang {idx+1} không đọc được — đã chèn ảnh trang gốc")
+        else:
+            cache.put(idx, md)
 
         results[idx] = md
         done[0] += 1
@@ -2320,12 +2481,17 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
             for i in idxs:
                 tasks.append(("C", i, [i]))
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = [ex.submit(_do_simple, st, ix) if k == "S"
-                else ex.submit(_do_complex, st)
-                for (k, st, ix) in tasks]
-        for f in as_completed(futs):
-            f.result()
+    # Sách scan lớn → 3 luồng (đỡ dính 429); đề ngắn giữ 4 luồng cho nhanh
+    n_workers = 3 if len(scan_set) > 40 else 4
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futs = [ex.submit(_do_simple, st, ix) if k == "S"
+                    else ex.submit(_do_complex, st)
+                    for (k, st, ix) in tasks]
+            for f in as_completed(futs):
+                f.result()
+    finally:
+        render.close()
 
     # Kiểm toán cuối: lưới an toàn độc lập với mọi nhánh ở trên. Đây là chỗ DUY
     # NHẤT phán quyết "trang này rỗng" nên không đường nào lọt được.
@@ -2354,86 +2520,6 @@ def _convert_via_hybrid(pdf_path: Path, work_dir: Path,
         "ocr_used": bool(scan_set),
     }
     return md_path, stats
-
-
-def _extract_digital_pdf_images(pdf_path: Path, work_dir: Path,
-                                 md_path: Path) -> Path:
-    """
-    Trích xuất ảnh nhúng từ PDF digital (có text layer) dùng fitz.
-    Ảnh nhỏ (hình vẽ, đồ thị < 400k px) được giữ lại và chèn vào đúng
-    vị trí trong Markdown dựa theo tọa độ Y trên trang.
-    """
-    import re as _re
-    try:
-        import fitz
-        from PIL import Image as PILImage
-        import io as _io
-    except ImportError:
-        return md_path   # Thiếu thư viện → bỏ qua, không lỗi
-
-    MAX_PX = 400_000   # Lớn hơn → ảnh trang scan → bỏ
-    MIN_PX = 900       # Nhỏ hơn → icon/bullet → bỏ
-
-    fig_dir = work_dir / "figures"
-    fig_dir.mkdir(exist_ok=True)
-
-    doc = fitz.open(str(pdf_path))
-    # Thu thập tất cả ảnh nhúng cùng vị trí Y trên từng trang
-    page_images: list[tuple[int, float, Path]] = []  # (page_idx, y_pct, img_path)
-    global_img_id = 0
-
-    for page_idx, page in enumerate(doc):
-        img_list = page.get_images(full=True)
-        for xref, *_ in img_list:
-            try:
-                base = doc.extract_image(xref)
-                img_bytes = base["image"]
-                img = PILImage.open(_io.BytesIO(img_bytes))
-                w, h = img.size
-                px = w * h
-                if px < MIN_PX or px > MAX_PX:
-                    continue   # Quá nhỏ (icon) hoặc quá lớn (trang scan)
-
-                global_img_id += 1
-                img_name = f"p{page_idx+1}_emb{global_img_id}.png"
-                img.save(fig_dir / img_name, "PNG")
-
-                # Tìm vị trí Y của ảnh trên trang (dùng get_image_rects)
-                rects = page.get_image_rects(xref)
-                y_pct = 50.0  # mặc định giữa trang
-                if rects:
-                    r = rects[0]
-                    page_h = page.rect.height
-                    y_pct = ((r.y0 + r.y1) / 2 / page_h * 100) if page_h else 50.0
-
-                page_images.append((page_idx, y_pct, fig_dir / img_name))
-            except Exception:
-                pass
-
-    doc.close()
-
-    if not page_images:
-        return md_path
-
-    # Chèn ảnh vào Markdown — sau đoạn text gần nhất cùng trang
-    content = md_path.read_text(encoding="utf-8", errors="replace")
-    pages = content.split("\n\n---\n\n")
-
-    for (page_idx, y_pct, img_path) in page_images:
-        if page_idx >= len(pages):
-            continue
-        pg = pages[page_idx]
-        lines = pg.splitlines()
-        # Ước lượng dòng tương ứng với y_pct trong trang
-        target_line = int(y_pct / 100 * len(lines)) if lines else 0
-        target_line = max(0, min(target_line, len(lines)))
-        # Chèn sau target_line
-        rel = f"figures/{img_path.name}"
-        lines.insert(target_line, f"\n![Hình]({rel})\n")
-        pages[page_idx] = "\n".join(lines)
-
-    md_path.write_text("\n\n---\n\n".join(pages), encoding="utf-8")
-    return md_path
 
 
 def _attach_det_figures(pdf_path: Path, work_dir: Path, md_path: Path,
